@@ -1,0 +1,32 @@
+{
+  "roomId": "RGGCP06",
+  "startedAt": 1763020316558,
+  "endedAt": 1763020368063,
+  "participants": [
+    {
+      "id": "u_ha6w2716",
+      "name": "lake"
+    },
+    {
+      "id": "u_q3g9cfl6",
+      "name": "lakshmi"
+    }
+  ],
+  "events": [
+    {
+      "kind": "chat",
+      "userId": "u_ha6w2716",
+      "name": "lake",
+      "text": "hi",
+      "ts": 1763020316558
+    },
+    {
+      "kind": "voice",
+      "userId": "u_q3g9cfl6",
+      "name": "lakshmi",
+      "text": "Emotions",
+      "ts": 1763020347146
+    }
+  ],
+  "transcriptText": "[2025-11-13T07:51:56.558Z] lake: hi\n[2025-11-13T07:52:27.146Z] lakshmi: Emotions"
+}

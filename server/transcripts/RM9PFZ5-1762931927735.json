@@ -1,0 +1,32 @@
+{
+  "roomId": "RM9PFZ5",
+  "startedAt": 1762931872902,
+  "endedAt": 1762931927735,
+  "participants": [
+    {
+      "id": "u_8aoa5pb1",
+      "name": "lakshmi-xs4"
+    },
+    {
+      "id": "u_70mhfesl",
+      "name": "lake-5h0"
+    }
+  ],
+  "events": [
+    {
+      "kind": "chat",
+      "userId": "u_8aoa5pb1",
+      "name": "lakshmi-xs4",
+      "text": "hi",
+      "ts": 1762931872902
+    },
+    {
+      "kind": "chat",
+      "userId": "u_70mhfesl",
+      "name": "lake-5h0",
+      "text": "hlo",
+      "ts": 1762931878225
+    }
+  ],
+  "transcriptText": "[2025-11-12T07:17:52.902Z] lakshmi-xs4: hi\n[2025-11-12T07:17:58.225Z] lake-5h0: hlo"
+}

@@ -1,0 +1,32 @@
+{
+  "roomId": "R23YXHQ",
+  "startedAt": 1762932386664,
+  "endedAt": 1762932681156,
+  "participants": [
+    {
+      "id": "u_58f0kq6q",
+      "name": "Lake-2w4"
+    },
+    {
+      "id": "u_3lpmvbq5",
+      "name": "lakshmi-vc3"
+    }
+  ],
+  "events": [
+    {
+      "kind": "chat",
+      "userId": "u_58f0kq6q",
+      "name": "Lake-2w4",
+      "text": "hi",
+      "ts": 1762932386664
+    },
+    {
+      "kind": "chat",
+      "userId": "u_3lpmvbq5",
+      "name": "lakshmi-vc3",
+      "text": "hlo",
+      "ts": 1762932391509
+    }
+  ],
+  "transcriptText": "[2025-11-12T07:26:26.664Z] Lake-2w4: hi\n[2025-11-12T07:26:31.509Z] lakshmi-vc3: hlo"
+}

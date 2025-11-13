@@ -1,0 +1,42 @@
+{
+  "roomId": "RBB2P0X",
+  "startedAt": 1762952735511,
+  "endedAt": 1762952912494,
+  "participants": [
+    {
+      "id": "u_vjxz5qn0",
+      "name": "lakshmi-xht"
+    }
+  ],
+  "events": [
+    {
+      "kind": "voice",
+      "userId": "u_vjxz5qn0",
+      "name": "lakshmi-xht",
+      "text": "Are you able to hear me",
+      "ts": 1762952735511
+    },
+    {
+      "kind": "voice",
+      "userId": "u_vjxz5qn0",
+      "name": "lakshmi-xht",
+      "text": "Can I know your name",
+      "ts": 1762952740430
+    },
+    {
+      "kind": "voice",
+      "userId": "u_vjxz5qn0",
+      "name": "lakshmi-xht",
+      "text": "Whatever's collaboration",
+      "ts": 1762952750938
+    },
+    {
+      "kind": "voice",
+      "userId": "u_vjxz5qn0",
+      "name": "lakshmi-xht",
+      "text": "Copy code",
+      "ts": 1762952760710
+    }
+  ],
+  "transcriptText": "[2025-11-12T13:05:35.511Z] lakshmi-xht: Are you able to hear me\n[2025-11-12T13:05:40.430Z] lakshmi-xht: Can I know your name\n[2025-11-12T13:05:50.938Z] lakshmi-xht: Whatever's collaboration\n[2025-11-12T13:06:00.710Z] lakshmi-xht: Copy code"
+}

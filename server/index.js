@@ -1,11 +1,19 @@
 require('dotenv').config();
 const http = require('http');
 const { Server } = require('socket.io');
+const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@deepgram/sdk');
+const cors = require('cors');
 const PORT = process.env.PORT || 3001;
-const server = http.createServer();
+// Build Express app first so it can be attached to the same HTTP server as socket.io
+const app = express();
+app.use(cors({ origin: [/localhost:\d+$/], credentials: true }));
+app.use(express.json({ limit: '2mb' }));
+app.get('/health', (_req, res) => res.json({ ok: true }));
+// Create a single HTTP server for both Express and Socket.IO
+const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: [
@@ -22,16 +30,35 @@ const io = new Server(server, {
   maxHttpBufferSize: 5e7 // 50 MB
 });
 
+// Optional: enable Socket.IO Redis adapter when clustering across processes/instances
+(async () => {
+  try {
+    const REDIS_URL = process.env.REDIS_URL;
+    if (!REDIS_URL) return; // no-op if not configured
+    const { createAdapter } = require('@socket.io/redis-adapter');
+    const { createClient } = require('redis');
+    const pub = createClient({ url: REDIS_URL });
+    const sub = pub.duplicate();
+    await Promise.all([pub.connect(), sub.connect()]);
+    io.adapter(createAdapter(pub, sub));
+    console.log('Socket.IO Redis adapter enabled');
+  } catch (e) {
+    console.warn('Redis adapter not enabled:', (e && e.message) || e);
+  }
+})();
+
 const whiteboards = new Map(); // roomId -> { actions: Array<stroke|fill> }
 const roomMedia = new Map();   // roomId -> { items: Array<{name,type,dataUrl}> }
 const roomDocs = new Map();    // roomId -> { text: string }
 const roomTranscripts = new Map(); // roomId -> { segments: Array<{ userId, name, text, ts }> }
 const roomChats = new Map();   // roomId -> { messages: Array<{ userId, name, text, ts, cid? }> }
+const roomPresence = new Map(); // roomId -> Map<userId, { mic: boolean; cam: boolean }>
+const MED_KEYWORDS = ['dose','dosage','mg','antibiotic','analgesic','trial','clinical','study','randomized','placebo','arm','efficacy','effect','side effect','adverse','toxicity','contraindication','pharmacokinetics','pk','pd','onset','duration','synergy','interaction','paracetamol','ibuprofen','molecule'];
 
 const transcriptsDir = path.join(__dirname, 'transcripts');
 try { if (!fs.existsSync(transcriptsDir)) fs.mkdirSync(transcriptsDir, { recursive: true }); } catch {}
-// Batch-only switch (disable Deepgram live websockets). Default true for reliability on restrictive networks.
-const STT_BATCH_ONLY = (process.env.STT_BATCH_ONLY === '1' || process.env.STT_BATCH_ONLY === 'true' || true);
+// Batch-only switch (disable Deepgram live websockets). Default false; enable only if explicitly set.
+const STT_BATCH_ONLY = (process.env.STT_BATCH_ONLY === '1' || process.env.STT_BATCH_ONLY === 'true');
 
 // Batch transcription fallback state (per room)
 const roomAudio = new Map(); // roomId -> { mimetype: string, chunks: Buffer[], timer: NodeJS.Timeout|null }
@@ -107,6 +134,13 @@ io.on('connection', (socket) => {
     if (!whiteboards.has(roomId)) whiteboards.set(roomId, { actions: [] });
     if (!roomMedia.has(roomId)) roomMedia.set(roomId, { items: [] });
     if (!roomChats.has(roomId)) roomChats.set(roomId, { messages: [] });
+    if (!roomPresence.has(roomId)) roomPresence.set(roomId, new Map());
+    // Send current media presence state to the joining client
+    try {
+      const presence = Array.from((roomPresence.get(roomId) || new Map()).entries())
+        .map(([uid, st]) => ({ userId: uid, mic: !!st.mic, cam: !!st.cam }));
+      if (presence.length) socket.emit('presence:media:state', presence);
+    } catch {}
   });
 
   // Live STT streaming via Deepgram
@@ -220,31 +254,7 @@ io.on('connection', (socket) => {
         }
       } catch {}
 
-      // Live-DG event hooks are installed only when not in batch-only mode
-      const handleTranscript = (dgMsg) => {
-        try {
-          const ch = dgMsg && dgMsg.channel;
-          const alt = ch && ch.alternatives && ch.alternatives[0];
-          const text = (alt && alt.transcript) || '';
-          if (!text) return;
-          const isFinal = Boolean(dgMsg.is_final);
-          if (isFinal) {
-            // Save and broadcast to room as a final segment
-            const entry = { userId: user?.id, name: user?.name || 'Guest', text: text.trim(), ts: Date.now() };
-            const bag = roomTranscripts.get(joinedRoom) || { segments: [] };
-            bag.segments.push(entry);
-            roomTranscripts.set(joinedRoom, bag);
-            io.to(joinedRoom).emit('stt:segment', entry);
-          } else {
-            // Send interim back only to the speaker
-            socket.emit('stt:interim', { text });
-          }
-        } catch {}
-      };
-      if (dgConn && typeof dgConn.on === 'function') {
-        dgConn.on('transcript', handleTranscript);
-        dgConn.on('transcriptReceived', handleTranscript);
-      }
+      // Note: transcript listeners are already attached above when dgConn is created.
     } catch (e) {
       socket.emit('stt:dg:status', { ok: false, event: 'start_error', error: String(e && e.message || e) });
     }
@@ -286,6 +296,11 @@ io.on('connection', (socket) => {
     bag.segments.push(entry);
     roomTranscripts.set(joinedRoom, bag);
     io.to(joinedRoom).emit('stt:segment', entry);
+  });
+  // Relay interim to room so others also see live text (not persisted)
+  socket.on('stt:interim', (payload) => {
+    if (!joinedRoom || !payload || typeof payload.text !== 'string') return;
+    socket.to(joinedRoom).emit('stt:interim', { text: payload.text });
   });
   socket.on('stt:requestState', () => {
     if (!joinedRoom) return;
@@ -335,6 +350,21 @@ io.on('connection', (socket) => {
     if (targetSid) {
       io.to(targetSid).emit('webrtc:signal', { from: from || user.id, data });
     }
+  });
+
+  // Media presence: broadcast mic/cam state to the room
+  socket.on('presence:media', (payload) => {
+    if (!joinedRoom || !user) return;
+    try {
+      const mic = !!(payload && payload.mic);
+      const cam = !!(payload && payload.cam);
+      // Persist last known media presence
+      try {
+        if (!roomPresence.has(joinedRoom)) roomPresence.set(joinedRoom, new Map());
+        roomPresence.get(joinedRoom).set(user.id, { mic, cam });
+      } catch {}
+      io.to(joinedRoom).emit('presence:media', { userId: user.id, mic, cam });
+    } catch {}
   });
 
   socket.on('avatar:pose', (payload) => {
@@ -426,7 +456,7 @@ io.on('connection', (socket) => {
       socket.emit('ai:summary', { summary: top });
     } catch {
       socket.emit('ai:summary', { summary: '' });
-    } 
+    }
   });
 
   // Media sharing: broadcast newly added files as data URLs to the room
@@ -437,7 +467,8 @@ io.on('connection', (socket) => {
     const stash = roomMedia.get(joinedRoom) || { items: [] };
     stash.items.push(...items);
     roomMedia.set(joinedRoom, stash);
-    socket.to(joinedRoom).emit('media:add', { items });
+    const sender = { id: user?.id, name: user?.name };
+    io.to(joinedRoom).emit('media:add', { items, user: sender });
   });
 
   socket.on('media:requestState', () => {
@@ -447,17 +478,21 @@ io.on('connection', (socket) => {
   });
 
   socket.on('chat:message', (payload) => {
-    if (!joinedRoom || !payload || typeof payload.text !== 'string') return;
+    if (!joinedRoom || !payload) return;
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    const text = typeof payload.text === 'string' ? payload.text : '';
+    if (!text && attachments.length === 0) return;
     const msg = {
       userId: user?.id,
       name: user?.name || 'Guest',
-      text: payload.text,
+      text,
+      attachments, // each: { name, type, dataUrl }
       ts: Date.now(),
       cid: payload.cid,
     };
     try {
       const chat = roomChats.get(joinedRoom) || { messages: [] };
-      chat.messages.push({ userId: msg.userId, name: msg.name, text: msg.text, ts: msg.ts, cid: msg.cid });
+      chat.messages.push({ userId: msg.userId, name: msg.name, text: msg.text, ts: msg.ts, cid: msg.cid, attachments: msg.attachments });
       roomChats.set(joinedRoom, chat);
     } catch {}
     io.to(joinedRoom).emit('chat:message', msg);
@@ -516,12 +551,166 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     if (joinedRoom && user) {
       socket.to(joinedRoom).emit('presence:leave', user);
+      try { const m = roomPresence.get(joinedRoom); if (m) m.delete(user.id); } catch {}
     }
     // Clean up any Deepgram connection for this socket
     try { if (dgConn && typeof dgConn.finish === 'function') { dgConn.finish(); } } catch {}
     dgConn = null;
   });
 });
+
+// Optional Mongo-backed login (graceful fallback if mongoose not installed or no MONGO_URI)
+try {
+  const mongoose = require('mongoose');
+  const MONGO_URI = process.env.MONGO_URI;
+  if (MONGO_URI) {
+    mongoose.set('strictQuery', true);
+    mongoose.connect(MONGO_URI, { dbName: process.env.MONGO_DB || 'metaverse' })
+      .then(()=> console.log('MongoDB connected'))
+      .catch(()=> console.warn('MongoDB connection failed; using in-memory auth'));
+    const UserSchema = new mongoose.Schema({
+      name: { type: String, required: true },
+      specialization: { type: String, required: true },
+      createdAt: { type: Date, default: Date.now }
+    });
+    const User = mongoose.models.User || mongoose.model('User', UserSchema);
+    const SummarySchema = new mongoose.Schema({
+      roomId: String,
+      summary: [String],
+      createdAt: { type: Date, default: Date.now }
+    });
+    const Summary = mongoose.models.Summary || mongoose.model('Summary', SummarySchema);
+    app.post('/api/auth/login', async (req, res) => {
+      try {
+        const { name, specialization } = req.body || {};
+        if (!name || !specialization) return res.status(400).json({ ok: false, error: 'Missing fields' });
+        const doc = await User.findOneAndUpdate(
+          { name },
+          { $set: { name, specialization } },
+          { upsert: true, new: true }
+        );
+        return res.json({ ok: true, user: { id: doc._id.toString(), name: doc.name, specialization: doc.specialization } });
+      } catch (e) { return res.status(500).json({ ok: false, error: 'DB error' }); }
+    });
+
+    // AI summarization endpoint: gathers transcript (by roomId or provided text), filters by medical keywords,
+    // calls OpenAI for a focused summary, returns lines, and stores to Mongo.
+    app.post('/api/ai/summary', async (req, res) => {
+      try {
+        const { roomId, text } = req.body || {};
+        let base = '';
+        if (typeof text === 'string' && text.trim()) base = text.trim();
+        else if (roomId) {
+          const bag = roomTranscripts.get(roomId) || { segments: [] };
+          const chat = roomChats.get(roomId) || { messages: [] };
+          const voice = (bag.segments || []).map(s => `${s.name||'User'}: ${s.text}`);
+          const msgs = (chat.messages || []).filter(m=> (m && typeof m.text === 'string' && m.text.trim())).map(m => `${m.name||'User'}: ${m.text}`);
+          base = [...voice, ...msgs].join('\n');
+        }
+        base = (base || '').toString();
+        if (!base.trim()) return res.json({ ok: true, summary: [] });
+        const lines = base.split(/\n+/).filter(Boolean);
+        const filtered = lines.filter(l => {
+          const low = l.toLowerCase();
+          return MED_KEYWORDS.some(k => low.includes(k));
+        });
+        const focusText = (filtered.length ? filtered.join('\n') : base).slice(0, 8000);
+        const apiKey = process.env.OPENAI_API_KEY || '';
+        if (!apiKey) return res.status(200).json({ ok: true, summary: [
+          'Set OPENAI_API_KEY to enable AI summarization.',
+          'Fallback: install a key and retry.'
+        ]});
+        const prompt = `Summarize the following meeting focusing on: drug effects, side effects, dosage, clinical trial outcomes, and suggestions. Write 5-8 concise bullet points.\n\nText:\n${focusText}`;
+        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.3,
+            max_tokens: 400
+          })
+        });
+        if (!resp.ok) {
+          // Fallback: local extractive summary so the UI never shows an error
+          const txt = (filtered.length ? filtered.join(' ') : base);
+          const sentences = txt.split(/(?<=[.!?])\s+/).slice(0, 40);
+          const words = txt.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
+          const stop = new Set(['the','and','a','an','to','of','in','is','it','that','for','on','with','as','are','was','be']);
+          const freq = new Map(); for (const w of words) { if (!stop.has(w)) freq.set(w, (freq.get(w)||0)+1); }
+          const scored = sentences.map(s=>({ s, score: s.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean).reduce((sum,w)=>sum+(freq.get(w)||0),0) / Math.sqrt((s.split(/\s+/).length)||1) }));
+          scored.sort((a,b)=>b.score-a.score);
+          const items = scored.slice(0,6).map(x=>x.s.trim());
+          return res.status(200).json({ ok: true, summary: items });
+        }
+        const js = await resp.json();
+        const content = js?.choices?.[0]?.message?.content || '';
+        const items = content.split(/\n+/).map(s=>s.replace(/^[-*\s]+/,'').trim()).filter(Boolean).slice(0, 10);
+        try { if (roomId) await Summary.create({ roomId, summary: items }); } catch {}
+        return res.json({ ok: true, summary: items });
+      } catch (e) {
+        // Fallback on any error: local extractive summary from base
+        try {
+          const txt = (filtered && filtered.length ? filtered.join(' ') : base);
+          const sentences = txt.split(/(?<=[.!?])\s+/).slice(0, 40);
+          const words = txt.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
+          const stop = new Set(['the','and','a','an','to','of','in','is','it','that','for','on','with','as','are','was','be']);
+          const freq = new Map(); for (const w of words) { if (!stop.has(w)) freq.set(w, (freq.get(w)||0)+1); }
+          const scored = sentences.map(s=>({ s, score: s.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean).reduce((sum,w)=>sum+(freq.get(w)||0),0) / Math.sqrt((s.split(/\s+/).length)||1) }));
+          scored.sort((a,b)=>b.score-a.score);
+          const items = scored.slice(0,6).map(x=>x.s.trim());
+          return res.status(200).json({ ok: true, summary: items });
+        } catch {
+          return res.status(200).json({ ok: true, summary: [] });
+        }
+      }
+    });
+  } else {
+    app.post('/api/auth/login', (req, res) => {
+      const { name, specialization } = req.body || {};
+      if (!name || !specialization) return res.status(400).json({ ok: false, error: 'Missing fields' });
+      return res.json({ ok: true, user: { id: `mem_${Date.now()}`, name, specialization } });
+    });
+
+    app.post('/api/ai/summary', async (req, res) => {
+      try {
+        const { roomId, text } = req.body || {};
+        let base = '';
+        if (typeof text === 'string' && text.trim()) base = text.trim();
+        else if (roomId) {
+          const bag = roomTranscripts.get(roomId) || { segments: [] };
+          const chat = roomChats.get(roomId) || { messages: [] };
+          const voice = (bag.segments || []).map(s => `${s.name||'User'}: ${s.text}`);
+          const msgs = (chat.messages || []).filter(m=> (m && typeof m.text === 'string' && m.text.trim())).map(m => `${m.name||'User'}: ${m.text}`);
+          base = [...voice, ...msgs].join('\n');
+        }
+        base = (base || '').toString();
+        if (!base.trim()) return res.json({ ok: true, summary: [] });
+        const lines = base.split(/\n+/).filter(Boolean);
+        const filtered = lines.filter(l => {
+          const low = l.toLowerCase();
+          return MED_KEYWORDS.some(k => low.includes(k));
+        });
+        // No OpenAI key available in memory-mode; return simple extractive summary
+        const txt = (filtered.length ? filtered.join(' ') : base);
+        const sentences = txt.split(/(?<=[.!?])\s+/).slice(0, 40);
+        const words = txt.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
+        const stop = new Set(['the','and','a','an','to','of','in','is','it','that','for','on','with','as','are','was','be']);
+        const freq = new Map(); for (const w of words) { if (!stop.has(w)) freq.set(w, (freq.get(w)||0)+1); }
+        const scored = sentences.map(s=>({ s, score: s.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean).reduce((sum,w)=>sum+(freq.get(w)||0),0) / Math.sqrt((s.split(/\s+/).length)||1) }));
+        scored.sort((a,b)=>b.score-a.score);
+        const items = scored.slice(0,6).map(x=>x.s.trim());
+        return res.json({ ok: true, summary: items });
+      } catch { return res.json({ ok: true, summary: [] }); }
+    });
+  }
+} catch {
+  app.post('/api/auth/login', (req, res) => {
+    const { name, specialization } = req.body || {};
+    if (!name || !specialization) return res.status(400).json({ ok: false, error: 'Missing fields' });
+    return res.json({ ok: true, user: { id: `mem_${Date.now()}`, name, specialization } });
+  });
+}
 
 server.listen(PORT, () => {
   console.log(`socket.io server listening on http://localhost:${PORT}`);

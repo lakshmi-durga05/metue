@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { io, Socket } from "socket.io-client"; 
+import { Mic, MicOff, Video as VideoIcon, VideoOff, X, SquarePen, FileText, ChevronDown } from "lucide-react";
 export default function App() {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const xrBtnRef = useRef<HTMLDivElement | null>(null);
@@ -15,7 +16,8 @@ export default function App() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const userIdRef = useRef<string>(`u_${Math.random().toString(36).slice(2, 10)}`);
-  const [displayName, setDisplayName] = useState<string>(`Guest-${Math.floor(Math.random()*1000)}`);
+  const [displayName, setDisplayName] = useState<string>('');
+  const [specialization, setSpecialization] = useState<string>('');
   const [roomCodeInput, setRoomCodeInput] = useState<string>("");
   const nameRef = useRef<string>("");
   const tabTagRef = useRef<string>(""); 
@@ -26,8 +28,11 @@ export default function App() {
   const remoteCursorsRef = useRef<Record<string, THREE.Mesh>>({});
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const xrStatusRef = useRef<string>("Checking XR...");
+  const floorYRef = useRef<number>(0);
+  const nameMapRef = useRef<Record<string,string>>({});
   const peerConnsRef = useRef<Record<string, RTCPeerConnection>>({});
   const remoteStreamsRef = useRef<Record<string, MediaStream>>({});
+  const mediaPresenceRef = useRef<Record<string, { mic: boolean; cam: boolean }>>({});
   const audioCtxRef = useRef<AudioContext | null>(null);
   const remoteAudioRef = useRef<Record<string, { source: MediaStreamAudioSourceNode; panner: PannerNode }>>({});
   const remoteAudioElsRef = useRef<Record<string, HTMLAudioElement>>({});
@@ -44,11 +49,45 @@ export default function App() {
   const [avatarColor, setAvatarColor] = useState<string>("#4f46e5");
   const [sessionReady, setSessionReady] = useState<boolean>(false);
   const [authMode, setAuthMode] = useState<'login'|'signup'>('login');
+  const [profileOpen, setProfileOpen] = useState<boolean>(false);
   const avatarGallery: string[] = [
     'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><rect width="128" height="128" rx="24" fill="%234f46e5"/><circle cx="64" cy="52" r="28" fill="%23fff"/><rect x="24" y="84" width="80" height="28" rx="14" fill="%23fff"/></svg>',
     'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><rect width="128" height="128" rx="24" fill="%2310b981"/><circle cx="64" cy="50" r="26" fill="%23fef3c7"/><rect x="20" y="82" width="88" height="30" rx="15" fill="%23fef3c7"/></svg>',
     'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><rect width="128" height="128" rx="24" fill="%23f97316"/><circle cx="64" cy="50" r="26" fill="%23fff"/><rect x="20" y="82" width="88" height="30" rx="15" fill="%23fff"/></svg>'
   ];
+  const medicalRooms = [
+    { label: 'Effect of Ibuprofen on Inflammation', code: 'IBUPROFEN-INFLAMMATION' },
+    { label: 'New Antibiotic Trials', code: 'NEW-ANTIBIOTIC-TRIALS' },
+    { label: 'AI-Generated Drug Discovery Discussion', code: 'AI-DRUG-DISCOVERY' },
+    { label: 'Cancer Immunotherapy Candidates', code: 'CANCER-IMMUNOTHERAPY' },
+    { label: 'mRNA Delivery Optimization', code: 'MRNA-DELIVERY' }
+  ];
+  // AudioContext safe getter to appease TS nullability and browser policy
+  const ensureAudioCtx = async (): Promise<AudioContext> => {
+    if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') {
+      audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+    const ctx = audioCtxRef.current as AudioContext;
+    if (ctx.state !== 'running') { try { await ctx.resume(); } catch {} }
+    return ctx;
+  };
+
+  const requestAiSummary = async () => {
+    try {
+      setReportBusy(true);
+      setReportItems([]);
+      const resp = await fetch('http://localhost:3001/api/ai/summary', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId, text: '' })
+      });
+      const data = await resp.json().catch(()=>({ ok:false }));
+      setReportItems(Array.isArray(data?.summary) ? data.summary : []);
+      setReportOpen(true);
+    } catch {
+      setReportItems([]);
+      setReportOpen(true);
+    } finally { setReportBusy(false); }
+  };
 
   useEffect(() => { setMounted(true); }, []);
   
@@ -79,8 +118,12 @@ export default function App() {
   const [monitorOn, setMonitorOn] = useState<boolean>(false);
   const [chatOpen, setChatOpen] = useState<boolean>(true);
   const [chatInput, setChatInput] = useState<string>("");
-  const [chatLog, setChatLog] = useState<Array<{userId:string; name:string; text:string; ts:number}>>([]);
+  const [chatLog, setChatLog] = useState<Array<{userId:string; name:string; text?:string; ts:number; attachments?: Array<{ name:string; type:string; url:string }> }>>([]);
+  const [isTyping, setIsTyping] = useState<boolean>(false);
+  const [participantsCollapsed, setParticipantsCollapsed] = useState<boolean>(false);
   const [meetingEnded, setMeetingEnded] = useState<boolean>(false);
+  const chatFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [chatAttachments, setChatAttachments] = useState<Array<{ name:string; type:string; dataUrl:string }>>([]);
   const [medMode, setMedMode] = useState<boolean>(false);
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
   const [mediaItems, setMediaItems] = useState<Array<{ name:string; url:string; type:string }>>([]);
@@ -92,6 +135,9 @@ export default function App() {
   const [dashboardOpen, setDashboardOpen] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
   const [pasted, setPasted] = useState<boolean>(false);
+  const [reportOpen, setReportOpen] = useState<boolean>(false);
+  const [reportItems, setReportItems] = useState<string[]>([]);
+  const [reportBusy, setReportBusy] = useState<boolean>(false);
   // Collaborative doc + AI summary
   const [docOpen, setDocOpen] = useState<boolean>(false);
   const [docText, setDocText] = useState<string>("");
@@ -110,7 +156,8 @@ export default function App() {
   const [onboardingOpen, setOnboardingOpen] = useState<boolean>(false);
   const [mounted, setMounted] = useState<boolean>(false);
   const [avatarIdx, setAvatarIdx] = useState<number>(0);
-  const USE_BROWSER_SR = false;
+  const [transcriptOpen, setTranscriptOpen] = useState<boolean>(true);
+  const USE_BROWSER_SR = true;
   const animatedAvatars: string[] = [
     '/avatars/avatar1.jpg',
     '/avatars/avatar2.jpg',
@@ -147,6 +194,101 @@ export default function App() {
     }
   };
 
+  // Enlarge selected participant video in an overlay
+  const getStreamForPeer = (pid: string | null): MediaStream | null => {
+    if (!pid) return null;
+    if (pid === userIdRef.current) return mediaStreamRef.current || null;
+    return remoteStreamsRef.current[pid] || null;
+  };
+
+  const micLiveForUser = (uid: string): boolean => {
+    const p = mediaPresenceRef.current[uid];
+    if (p) return !!p.mic;
+    if (uid === userIdRef.current) return !!micEnabled;
+    const st = remoteStreamsRef.current[uid];
+    const a = st?.getAudioTracks?.()[0];
+    return !!(a && a.enabled && a.readyState === 'live');
+  };
+  const camLiveForUser = (uid: string): boolean => {
+    const p = mediaPresenceRef.current[uid];
+    if (p) return !!p.cam;
+    if (uid === userIdRef.current) return !!camEnabled;
+    const st = remoteStreamsRef.current[uid];
+    const v = st?.getVideoTracks?.()[0];
+    return !!(v && v.enabled && v.readyState === 'live');
+  };
+
+  // Persist chat and transcript per room to survive refresh
+  useEffect(() => {
+    if (!roomId) return;
+    try {
+      const rawChat = localStorage.getItem(`room:${roomId}:chat`);
+      if (rawChat) { const parsed = JSON.parse(rawChat); if (Array.isArray(parsed)) setChatLog(parsed); }
+      // Do not seed transcript from localStorage; rely on live STT/server state
+      transcriptRef.current = '';
+      setTranscript('');
+      setInterimText('');
+    } catch {}
+  }, [roomId]);
+  useEffect(() => {
+    if (!roomId) return;
+    try { localStorage.setItem(`room:${roomId}:chat`, JSON.stringify(chatLog.slice(-500))); } catch {}
+  }, [roomId, chatLog]);
+  useEffect(() => {
+    if (!roomId) return;
+    try { localStorage.setItem(`room:${roomId}:transcript`, JSON.stringify({ text: transcriptRef.current || transcript || '', interim: interimText || '' })); } catch {}
+  }, [roomId, transcript, interimText]);
+
+  const toggleMic = async () => {
+    try {
+      await ensureMediaIfNeeded?.();
+    } catch {}
+    const st = mediaStreamRef.current;
+    const atr = st?.getAudioTracks()?.[0] || null;
+    if (atr) {
+      try { atr.enabled = !atr.enabled; } catch {}
+      setMicEnabled(atr.enabled);
+      try { socketRef.current?.emit('presence:media', { mic: atr.enabled, cam: camEnabled }); } catch {}
+    } else {
+      try {
+        const a = (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0];
+        if (a) {
+          if (!mediaStreamRef.current) mediaStreamRef.current = new MediaStream();
+          mediaStreamRef.current.addTrack(a);
+          setMicEnabled(true);
+          try { socketRef.current?.emit('presence:media', { mic: true, cam: camEnabled }); } catch {}
+          try { await attachLocalTracksToAllPeers(); } catch {}
+        }
+      } catch {}
+    }
+  };
+
+  const toggleCam = async () => {
+    try {
+      await ensureMediaIfNeeded?.();
+    } catch {}
+    const st = mediaStreamRef.current;
+    const vtr = st?.getVideoTracks()?.[0] || null;
+    if (vtr) {
+      try { vtr.enabled = !vtr.enabled; } catch {}
+      setCamEnabled(vtr.enabled);
+      try { await attachLocalTracksToAllPeers(); } catch {}
+      try { socketRef.current?.emit('presence:media', { mic: micEnabled, cam: vtr.enabled }); } catch {}
+    } else {
+      try {
+        const v = (await navigator.mediaDevices.getUserMedia({ video: true })).getVideoTracks()[0];
+        if (v) {
+          if (!mediaStreamRef.current) mediaStreamRef.current = new MediaStream();
+          mediaStreamRef.current.addTrack(v);
+          setCamEnabled(true);
+          if (videoRef.current && mediaStreamRef.current) { try { videoRef.current.srcObject = mediaStreamRef.current; } catch {} }
+          try { await attachLocalTracksToAllPeers(); } catch {}
+          try { socketRef.current?.emit('presence:media', { mic: micEnabled, cam: true }); } catch {}
+        }
+      } catch {}
+    }
+  };
+
   // Deterministic small hash for per-user avatar selection and spawn angle
   const hashId = (s: string): number => {
     let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
@@ -158,6 +300,7 @@ export default function App() {
   // Motion tracking: declare before any usage in effects
   const [motionTracking, setMotionTracking] = useState<boolean>(false);
   const mousePosRef = useRef<{x:number;y:number}>({ x: 0.5, y: 0.5 });
+  const [enlargedPeer, setEnlargedPeer] = useState<string | null>(null);
 
   // Track mouse for simple head-orientation when motionTracking is enabled
   useEffect(() => {
@@ -173,20 +316,17 @@ export default function App() {
     if (!joined) return;
     setTimeout(() => { try { mountRef.current?.focus(); } catch {} }, 50);
     (async () => { try { await attachLocalTracksToAllPeers(); } catch {} })();
+    // Announce current media presence on join
+    try { socketRef.current?.emit('presence:media', { mic: micEnabled, cam: camEnabled }); } catch {}
   }, [joined]);
 
   // Ensure audio context is resumed on user interaction (Chrome autoplay policy)
   useEffect(() => {
     const kickAudio = async () => {
       try {
-        if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') {
-          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-        }
-        if (audioCtxRef.current.state !== 'running') {
-          await audioCtxRef.current.resume();
-        }
-        // Start Deepgram streaming if not already
-        if (joined && !dgStreamingRef.current) {
+        await ensureAudioCtx();
+        // Start Deepgram streaming if not already (only when browser SR is off)
+        if (!USE_BROWSER_SR && joined && !dgStreamingRef.current) {
           try { await startDeepgramStreaming(); } catch {}
         }
       } catch {}
@@ -200,6 +340,8 @@ export default function App() {
   }, [joined]);
 
   // Motion tracking state declared above
+
+  // presence:media listener moved into main socket setup below
 
   // Movement + animation loop: move local avatar toward target and update mixers
   useEffect(() => {
@@ -281,6 +423,38 @@ export default function App() {
     const id = requestAnimationFrame(loop);
     return () => { stop = true; cancelAnimationFrame(id); };
   }, [joined, meetingEnded, motionTracking]);
+  // Smooth remote avatar movement by interpolating toward last received targets
+  useEffect(() => {
+    if (!joined || meetingEnded) return;
+    let stop = false;
+    let last = performance.now();
+    const loop = (ts: number) => {
+      if (stop) return;
+      const dt = Math.min(0.05, Math.max(0.0, (ts - last) / 1000));
+      last = ts;
+      try {
+        const group = remoteGroupRef.current; const scene = sceneRef.current;
+        if (group && scene) {
+          for (const uid of Object.keys(remoteAvatarsRef.current)) {
+            const obj = remoteAvatarsRef.current[uid];
+            const tgt = remotePoseTargetsRef.current[uid];
+            if (!obj || !tgt) continue;
+            const feet = (obj as any).__feetOffset || 0;
+            const floorY = floorYRef.current || floorYAt(scene, tgt.p[0], tgt.p[2]);
+            const targetPos = new THREE.Vector3(tgt.p[0], Math.max(0, floorY + feet), tgt.p[2]);
+            obj.position.lerp(targetPos, Math.min(1, 10 * dt));
+            // Smooth yaw rotation toward target using shortest-arc
+            const curY = obj.rotation.y; const targetY = tgt.r[1];
+            let dy = targetY - curY; while (dy > Math.PI) dy -= 2*Math.PI; while (dy < -Math.PI) dy += 2*Math.PI;
+            obj.rotation.y = curY + dy * Math.min(1, 10 * dt);
+          }
+        }
+      } catch {}
+      requestAnimationFrame(loop);
+    };
+    const id = requestAnimationFrame(loop);
+    return () => { stop = true; cancelAnimationFrame(id); };
+  }, [joined, meetingEnded]);
 
   // If peers already exist, add local tracks to all of them (for pre-warmed media)
   const attachLocalTracksToAllPeers = async () => {
@@ -440,7 +614,7 @@ export default function App() {
         };
         setAuthedUser(profile);
         setDisplayName(profile.name);
-        localStorage.setItem('authUser', JSON.stringify(profile));
+        sessionStorage.setItem('authUser', JSON.stringify(profile));
         sessionStorage.setItem('sessionAuthed','1');
         setSessionReady(true);
         setAuthOpen(false);
@@ -484,7 +658,7 @@ export default function App() {
         };
         setAuthedUser(profile);
         setDisplayName(profile.name);
-        localStorage.setItem('authUser', JSON.stringify(profile));
+        sessionStorage.setItem('authUser', JSON.stringify(profile));
         sessionStorage.setItem('sessionAuthed','1');
         setSessionReady(true);
         setAuthOpen(false);
@@ -513,32 +687,36 @@ export default function App() {
       let hadResult = false;
       // Ensure mic analyser is active for a visible input level
       try {
-        if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') {
-          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-        }
-        if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume();
+        const ctx = await ensureAudioCtx();
         const st = mediaStreamRef.current || (await navigator.mediaDevices.getUserMedia({ audio: true }));
         mediaStreamRef.current = st;
         if (!micMonitorRef.current) {
-          const src = audioCtxRef.current.createMediaStreamSource(st);
-          const gain = audioCtxRef.current.createGain();
+          const src = ctx.createMediaStreamSource(st);
+          const gain = ctx.createGain();
           gain.gain.value = monitorOn ? 0.15 : 0.0; // optional local monitor
-          src.connect(gain).connect(audioCtxRef.current.destination);
+          src.connect(gain).connect(ctx.destination);
           micMonitorRef.current = { source: src, gain } as any;
         }
         // Update monitor gain if toggled later
-        try { if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = monitorOn ? 0.15 : 0.0; } catch {}
+        try {
+          const mmAny = micMonitorRef.current as any;
+          if (mmAny && mmAny.gain && mmAny.gain.gain) {
+            mmAny.gain.gain.value = monitorOn ? 0.15 : 0.0;
+          }
+        } catch {}
         if (!micAnalyserRef.current && micMonitorRef.current) {
-          const analyser = audioCtxRef.current.createAnalyser();
-          analyser.fftSize = 256;
-          micAnalyserRef.current = analyser;
-          micMonitorRef.current.source.connect(analyser);
+          const a = (audioCtxRef.current as AudioContext).createAnalyser();
+          a.fftSize = 256;
+          micAnalyserRef.current = a;
+          try { micMonitorRef.current?.source?.connect?.(a); } catch {}
         }
-        if (!micLevelRafRef.current && micAnalyserRef.current) {
-          const analyser = micAnalyserRef.current;
-          const data = new Uint8Array(analyser.frequencyBinCount);
+        if (!micLevelRafRef.current) {
+          const a = micAnalyserRef.current;
+          if (!a) return;
+          const a2 = a as AnalyserNode; // capture narrowed non-null for closure
+          const data = new Uint8Array(a2.frequencyBinCount || 0);
           const loop = () => {
-            try { analyser.getByteTimeDomainData(data); } catch {}
+            try { a2.getByteTimeDomainData(data); } catch {}
             let sum = 0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum += v*v; }
             const rms = Math.sqrt(sum/data.length);
             setMicLevel(Math.min(1, rms*2));
@@ -597,6 +775,7 @@ export default function App() {
 
   // Deepgram live streaming (Option B)
   const startDeepgramStreaming = async () => {
+    if (USE_BROWSER_SR) return; // browser-only STT mode
     if (!socketRef.current) return;
     try {
       const st = mediaStreamRef.current || await navigator.mediaDevices.getUserMedia({
@@ -612,28 +791,25 @@ export default function App() {
       mediaStreamRef.current = st;
       // Ensure mic analyser is active for a visible input level
       try {
-        if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') {
-          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-        }
-        if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume();
+        const ctx = await ensureAudioCtx();
         if (!micMonitorRef.current) {
-          const src = audioCtxRef.current.createMediaStreamSource(st);
-          const gain = audioCtxRef.current.createGain();
+          const src = ctx.createMediaStreamSource(st);
+          const gain = ctx.createGain();
           gain.gain.value = monitorOn ? 0.15 : 0.0;
           src.connect(gain);
-          if (monitorOn) { try { gain.connect(audioCtxRef.current.destination); } catch {} }
+          if (monitorOn) { try { gain.connect(ctx.destination); } catch {} }
           micMonitorRef.current = { source: src, gain } as any;
         }
         try {
           if (micMonitorRef.current) {
             micMonitorRef.current.gain.gain.value = monitorOn ? 0.15 : 0.0;
             if (monitorOn) {
-              try { (micMonitorRef.current.gain as any).connect?.(audioCtxRef.current!.destination); } catch {}
+              try { (micMonitorRef.current.gain as any).connect?.((audioCtxRef.current as AudioContext).destination); } catch {}
             }
           }
         } catch {}
         if (!micAnalyserRef.current && micMonitorRef.current) {
-          const analyser = audioCtxRef.current.createAnalyser();
+          const analyser = (audioCtxRef.current as AudioContext).createAnalyser();
           analyser.fftSize = 256;
           micAnalyserRef.current = analyser;
           try { micMonitorRef.current.source.connect(analyser); } catch {}
@@ -674,7 +850,7 @@ export default function App() {
           const targetSr = 16000;
           const ratio = inputSr / targetSr;
           let remainder: Float32Array | null = null;
-          socketRef.current?.emit('stt:stream:start', { mimetype: 'pcm16', language: 'en-US' });
+          if (!USE_BROWSER_SR) socketRef.current?.emit('stt:stream:start', { mimetype: 'pcm16', language: 'en-US' });
           node.onaudioprocess = (e: AudioProcessingEvent) => {
             try {
               const ch0 = e.inputBuffer.getChannelData(0);
@@ -693,7 +869,7 @@ export default function App() {
                 const s = Math.max(-1, Math.min(1, data[i]));
                 out[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
               }
-              try { socketRef.current?.emit('stt:stream:chunk', out.buffer); } catch {}
+              try { if (!USE_BROWSER_SR) socketRef.current?.emit('stt:stream:chunk', out.buffer); } catch {}
             } catch {}
           };
           try { src.connect(node); node.connect(ctx.destination); } catch {}
@@ -713,7 +889,7 @@ export default function App() {
         }
         const mime = candidates[idx] || undefined as any;
         console.log('MediaRecorder mime =', mime || '(browser default)');
-        try { socketRef.current?.emit('stt:stream:start', { mimetype: mime || 'default', language: 'en-US' }); } catch {}
+        try { if (!USE_BROWSER_SR) socketRef.current?.emit('stt:stream:start', { mimetype: mime || 'default', language: 'en-US' }); } catch {}
         let rec: MediaRecorder;
         try { rec = new MediaRecorder(st, mime ? { mimeType: mime } : undefined as any); }
         catch (e) {
@@ -735,7 +911,7 @@ export default function App() {
           if (b && b.size) {
             console.log('MediaRecorder chunk size', b.size);
             b.arrayBuffer().then((ab) => {
-              try { socketRef.current?.emit('stt:stream:chunk', ab); } catch {}
+              try { if (!USE_BROWSER_SR) socketRef.current?.emit('stt:stream:chunk', ab); } catch {}
             }).catch(()=>{});
             if (!firstChunkTs) firstChunkTs = Date.now();
             emptyCount = 0;
@@ -750,7 +926,7 @@ export default function App() {
           }
         });
         rec.addEventListener('stop', () => {
-          try { socketRef.current?.emit('stt:stream:stop'); } catch {}
+          try { if (!USE_BROWSER_SR) socketRef.current?.emit('stt:stream:stop'); } catch {}
           dgStreamingRef.current = false;
           setDgActive(false);
         });
@@ -811,6 +987,66 @@ export default function App() {
     const idx = Math.max(0, avatarGallery.indexOf(val));
     return modelUrls[idx % modelUrls.length];
   };
+  // Deterministic doctor model selection per userId
+  const doctorModelForId = (id: string) => {
+    try {
+      const even = (id.charCodeAt(id.length - 1) % 2) === 0;
+      return even ? '/models/doctor1.glb' : '/models/doctor2.glb';
+    } catch { return '/models/doctor1.glb'; }
+  };
+  // Deterministic side-by-side spawn positions near entrance
+  const positionForId = (id: string): [number, number, number] => {
+    try {
+      const even = (id.charCodeAt(id.length - 1) % 2) === 0;
+      const x = even ? -0.9 : 0.9;
+      return [x, 0, 0.4];
+    } catch { return [0,0,0.4]; }
+  };
+  // Robust floor Y: raycast downward and choose surfaces with upward normals
+  const floorYAt = (scene: THREE.Scene, x: number, z: number): number => {
+    try {
+      const ray = new THREE.Raycaster();
+      const fromTop = new THREE.Vector3(x, 50, z);
+      const down = new THREE.Vector3(0, -1, 0);
+      ray.set(fromTop, down);
+      const hits = ray.intersectObjects(scene.children, true);
+      let best: number | null = null;
+      for (const h of hits) {
+        if (!h.face) continue;
+        const nrm = h.face.normal.clone().applyMatrix3(new THREE.Matrix3().getNormalMatrix(h.object.matrixWorld)).normalize();
+        if (nrm.y > 0.6) {
+          // Choose the highest upward-facing surface (most likely lab floor top)
+          if (best === null || h.point.y > best) best = h.point.y;
+        }
+      }
+      if (best !== null) return Math.max(0, best);
+    } catch {}
+    // Fallback to a sensible lab floor height
+    return 0.02;
+  };
+  // Place avatar at entrance, snapping to floor
+  const placeAvatarAtEntrance = (obj: THREE.Object3D, id: string) => {
+    const scene = sceneRef.current; if (!scene) return;
+    const p = positionForId(id);
+    const y = (floorYRef.current || floorYAt(scene, p[0], p[2]));
+    const feet = (obj as any).__feetOffset || 0;
+    obj.position.set(p[0], Math.max(0, y + feet), p[2]);
+  };
+
+  // Normalize avatar: scale to target height and compute feet offset to align to floor later
+  const normalizeAvatar = (obj: THREE.Object3D, targetHeight = 1.75) => {
+    try {
+      const bbox = new THREE.Box3().setFromObject(obj);
+      const size = bbox.getSize(new THREE.Vector3());
+      const min = bbox.min.clone();
+      const height = Math.max(0.001, size.y);
+      const scale = targetHeight / height;
+      obj.scale.multiplyScalar(scale);
+      // After scaling, compute feet offset (distance from local origin to feet)
+      const feetOffset = -min.y * scale;
+      (obj as any).__feetOffset = feetOffset;
+    } catch {}
+  };
   const handleWbTouchEnd = () => {
     if (!wbDrawingRef.current) return;
     wbDrawingRef.current = false;
@@ -825,18 +1061,22 @@ export default function App() {
   };
 
   const loadModel = async (url: string): Promise<{ group: THREE.Group; clips: THREE.AnimationClip[] }> => {
-    if (modelCacheRef.current[url]) {
-      const cached = modelCacheRef.current[url];
-      return { group: cached.scene.clone(true) as THREE.Group, clips: cached.clips };
-    }
+    // Always clone via SkeletonUtils.clone to preserve skinned mesh bindings
     try {
+      const cached = modelCacheRef.current[url];
+      const { clone } = await import('three/examples/jsm/utils/SkeletonUtils.js');
+      if (cached) {
+        const cloned = clone(cached.scene) as THREE.Group;
+        return { group: cloned, clips: cached.clips };
+      }
       const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
       const loader = new GLTFLoader();
       const gltf = await new Promise<any>((resolve, reject) => loader.load(url, resolve, undefined, reject));
-      const scene: THREE.Group = gltf.scene || new THREE.Group();
+      const baseScene: THREE.Group = gltf.scene || new THREE.Group();
       const clips: THREE.AnimationClip[] = gltf.animations || [];
-      modelCacheRef.current[url] = { scene, clips };
-      return { group: scene.clone(true) as THREE.Group, clips };
+      modelCacheRef.current[url] = { scene: baseScene, clips };
+      const cloned = clone(baseScene) as THREE.Group;
+      return { group: cloned, clips };
     } catch (e) {
       const g = new THREE.Group();
       const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.25, 0.9, 6, 12), new THREE.MeshStandardMaterial({ color: 0x22c55e }));
@@ -846,45 +1086,47 @@ export default function App() {
     }
   };
 
-  // Generate a small thumbnail image for a GLB/GLTF model via offscreen render
-  const generateGlbThumbnail = async (url: string): Promise<string> => {
-    try {
-      const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
-      const loader = new GLTFLoader();
-      const gltf = await new Promise<any>((resolve, reject) => loader.load(url, resolve, undefined, reject));
-      const scene = new THREE.Scene();
-      const obj = gltf.scene || new THREE.Group();
-      scene.add(obj);
-      const light = new THREE.DirectionalLight(0xffffff, 1); light.position.set(3,4,5); scene.add(light);
-      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-      const bbox = new THREE.Box3().setFromObject(obj);
-      const size = bbox.getSize(new THREE.Vector3());
-      const center = bbox.getCenter(new THREE.Vector3());
-      const w = 320, h = 240;
-      const cam = new THREE.PerspectiveCamera(50, w/h, 0.01, 100);
-      const dist = Math.max(size.length(), 1.0);
-      cam.position.set(center.x + dist, center.y + dist*0.6, center.z + dist);
-      cam.lookAt(center);
-      const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, alpha: true });
-      renderer.setSize(w, h); renderer.setPixelRatio(1);
-      renderer.render(scene, cam);
-      const dataUrl = (renderer.domElement as HTMLCanvasElement).toDataURL('image/png');
-      try { renderer.dispose(); } catch {}
-      return dataUrl;
-    } catch {
-      return '';
-    }
-  };
+  // Removed unused generateGlbThumbnail helper to avoid type errors
 
   const lastPoseRef = useRef<Record<string, { p: [number, number, number]; r: [number, number, number] }>>({});
+  const remotePoseTargetsRef = useRef<Record<string, { p: [number, number, number]; r: [number, number, number] }>>({});
+
+  // Helper: create a simple name tag placed above the head
+  const makeNameTag = (text: string) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512; canvas.height = 128;
+    const ctx = canvas.getContext('2d')!;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 48px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, canvas.width/2, canvas.height/2);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+    const mat = new THREE.SpriteMaterial({ map: tex, depthWrite: false, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    sprite.name = 'nameTag';
+    const scale = 0.9;
+    sprite.scale.set(scale, scale * (canvas.height/canvas.width), 1);
+    // Place above head for visibility
+    sprite.position.set(0, 1.9, 0.02);
+    return sprite;
+  };
 
   useEffect(() => {
-    const saved = localStorage.getItem('authUser');
+    // Always create a fresh unique user id per tab/session to avoid collisions across tabs
+    try { userIdRef.current = `u_${Math.random().toString(36).slice(2,10)}`; } catch {}
+
+    const saved = sessionStorage.getItem('authUser') || localStorage.getItem('authUser');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        setAuthedUser(parsed);
-        setDisplayName(parsed.name || displayName);
+        if (parsed && parsed.name) {
+          setAuthedUser(parsed);
+          setDisplayName(parsed.name || displayName);
+        }
       } catch {}
     }
     const session = sessionStorage.getItem('sessionAuthed');
@@ -927,6 +1169,8 @@ export default function App() {
 
     // Skip adding VRButton; we run in non-XR by default and optionally show status only
 
+    // Establish a global floor height for this session (locked)
+    floorYRef.current = 0.5;
     // Lights
     const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
     scene.add(hemi);
@@ -935,14 +1179,25 @@ export default function App() {
     dir.castShadow = true;
     scene.add(dir);
 
-    // Simple virtual room: floor + walls
-    const room = new THREE.Group();
-    scene.add(room);
+    // Props: microscope, test tubes, etc.
+    const props = new THREE.Group();
+    props.name = 'labProps';
     const floorGeo = new THREE.PlaneGeometry(12, 12);
     const floorMat = new THREE.MeshStandardMaterial({ color: 0xeeeeee });
     const floor = new THREE.Mesh(floorGeo, floorMat);
     floor.rotation.x = -Math.PI / 2;
     floor.receiveShadow = true;
+    props.add(floor);
+
+    // Simple virtual room: floor + walls
+    const room = new THREE.Group();
+    scene.add(room);
+    const floorGeo2 = new THREE.PlaneGeometry(12, 12);
+    const floorMat2 = new THREE.MeshStandardMaterial({ color: 0xeeeeee });
+    const floor2 = new THREE.Mesh(floorGeo2, floorMat2);
+    floor2.rotation.x = -Math.PI / 2;
+    floor2.receiveShadow = true;
+    room.add(floor2);
     room.add(floor);
     const wallMat = new THREE.MeshStandardMaterial({ color: 0xf5f5f5 });
     const wallGeo = new THREE.PlaneGeometry(12, 3);
@@ -975,15 +1230,46 @@ export default function App() {
     const grid = new THREE.GridHelper(50, 50, 0x94a3b8, 0xe2e8f0); // slate-400 / slate-200
     scene.add(grid);
 
-    // Demo content: spinning box avatar placeholder
-    const box = new THREE.Mesh(
-      new THREE.BoxGeometry(1, 1, 1),
-      new THREE.MeshStandardMaterial({ color: 0x4f46e5 }) // indigo-600
-    );
-    box.position.set(0, 0.5, 0);
-    box.castShadow = true;
-    box.name = 'placeholderBox';
-    scene.add(box);
+    // Optional: load lab scene shell if present
+    (async () => { try {
+      const labUrl = '/models/sci-fi_lab.glb';
+      const { group } = await loadModel(labUrl);
+      group.position.set(0, 0, 0);
+      scene.add(group);
+    } catch {} })();
+
+    // Central drug molecule as hologram (placed aside, not overlapping avatars)
+    const moleculeHolder = new THREE.Group();
+    moleculeHolder.name = 'moleculeHolder';
+    scene.add(moleculeHolder);
+    (async () => { try {
+      const tryUrls = ['/models/ibuprofen_model.glb', '/models/pills_-_paracetamol.glb'];
+      let obj: THREE.Group | null = null;
+      for (const u of tryUrls) {
+        try { const { group } = await loadModel(u); obj = group; break; } catch {}
+      }
+      if (obj) {
+        obj.traverse((o)=>{ const m = (o as any).material; if (m && m.isMaterial) { try { m.emissive = new THREE.Color(0x3D2C8D); m.emissiveIntensity = 0.25; } catch {} } });
+        const bbox = new THREE.Box3().setFromObject(obj);
+        const size = bbox.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z) || 1;
+        const s = 1.2 / maxDim; obj.scale.setScalar(s);
+        obj.position.set(-2.0, 1.0, 0);
+        moleculeHolder.add(obj);
+        const placeholder = scene.getObjectByName('placeholderBox'); if (placeholder) (placeholder as any).visible = false;
+      } else {
+        const holo = new THREE.Mesh(new THREE.IcosahedronGeometry(0.6, 1), new THREE.MeshStandardMaterial({ color: 0x7A00FF, emissive: 0x7A00FF, emissiveIntensity: 0.4, metalness: 0.1, roughness: 0.3 }));
+        holo.position.set(-2.0, 1.0, 0); moleculeHolder.add(holo);
+      }
+    } catch {} })();
+
+    // Add lab props provided in /models
+    (async () => { try { const { group } = await loadModel('/models/whiteboard.glb'); group.position.set(0, 1.3, -5.7); group.rotation.y = 0; try { group.scale.multiplyScalar(0.7); } catch {} scene.add(group); } catch {} })();
+    (async () => { try { const { group } = await loadModel('/models/test_tube_rack.glb'); group.position.set(4.2, 0, 1.2); try { group.scale.multiplyScalar(0.6); } catch {} scene.add(group); } catch {} })();
+    (async () => { try { const { group } = await loadModel('/models/microscope.glb'); group.position.set(3.8, 0, -1.4); scene.add(group); } catch {} })();
+    (async () => { try { const { group } = await loadModel('/models/pills_-_paracetamol.glb'); group.position.set(-3.6, 0.9, 1.0); scene.add(group); } catch {} })();
+
+    // Remove old placeholder avatar; avatars will be GLB doctors
 
     // Group to hold remote avatars
     const remoteGroup = new THREE.Group();
@@ -1010,7 +1296,7 @@ export default function App() {
       );
       if (isEditable) return;
       const down = e.type === 'keydown';
-      if (['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright'].includes(k)) {
+      if (['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright','q','e'].includes(k)) {
         keysRef.current[k] = down;
         e.preventDefault();
       }
@@ -1056,6 +1342,8 @@ export default function App() {
           if (k['s'] || k['arrowdown']) vz += 1;
           if (k['a'] || k['arrowleft']) vx -= 1;
           if (k['d'] || k['arrowright']) vx += 1;
+          if (k['q']) av.rotation.y += 1.2 * dt;
+          if (k['e']) av.rotation.y -= 1.2 * dt;
           // Click-to-move: steer toward target
           if (moveTargetRef.current) {
             const dx = moveTargetRef.current.x - av.position.x;
@@ -1084,12 +1372,12 @@ export default function App() {
               acts.current = 'idle';
             }
           }
-          // Simple lip/mouth movement: modulate slight X rotation by mic level
-          try {
-            const base = baseRotXRef.current || 0;
-            av.rotation.x = base + (micLevel || 0) * 0.08;
-          } catch {}
+          // Disable X-axis head wobble to prevent head/rig separation
+          try { /* keep avatar rotation stable on X */ } catch {}
           // emit pose at 10 Hz
+          // Always lock Y before emitting (include feet offset)
+          const feet = (av as any).__feetOffset || 0;
+          av.position.y = (floorYRef.current + feet);
           const now = performance.now();
           if (socketRef.current && now - lastEmitRef.current > 100) {
             lastEmitRef.current = now;
@@ -1102,6 +1390,10 @@ export default function App() {
           moveTargetRef.current = null;
         }
       }
+      // Name tags are attached to body and remain in local space (no billboarding)
+      // Rotate molecule slowly
+      const holder = scene.getObjectByName('moleculeHolder');
+      if (holder) holder.rotation.y += 0.2 * dt;
       controls.update();
       renderer.render(scene, camera);
     });
@@ -1182,19 +1474,33 @@ export default function App() {
     return () => window.removeEventListener('keydown', onEsc);
   }, []);
 
+  // Auto-generate AI summary when meeting ends
+  useEffect(() => {
+    if (meetingEnded) { try { requestAiSummary(); } catch {} }
+  }, [meetingEnded]);
+
   // Ensure a 3D avatar is loaded for the local user by default
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
     if (localAvatarRef.current) return;
-    const selected = authedUser?.avatar?.value || avatarImage;
-    const url = modelUrlForAvatar(selected);
+    // Use deterministic doctor model for the local user
+    const url = doctorModelForId(userIdRef.current);
     (async () => {
       const { group: obj, clips } = await loadModel(url);
       obj.traverse((o) => { (o as any).castShadow = true; });
       scene.add(obj);
+      // Normalize and place at deterministic entrance position
+      try { normalizeAvatar(obj, 1.75); } catch {}
+      try { placeAvatarAtEntrance(obj, userIdRef.current); } catch {}
       localAvatarRef.current = obj;
       baseRotXRef.current = obj.rotation.x || 0;
+      // Add floating name tag with specialization (local only)
+      try {
+        const nm = (authedUser?.name || displayName || 'Guest').toString();
+        const tag = makeNameTag(nm);
+        obj.add(tag);
+      } catch {}
       if (clips && clips.length) {
         localMixerRef.current = new THREE.AnimationMixer(obj);
         const idle = clips[0];
@@ -1214,11 +1520,12 @@ export default function App() {
     if (!roomId || !joined) return;
     const socket = io("http://localhost:3001", { transports: ["websocket"], withCredentials: false });
     socketRef.current = socket;
-    // Per-tab tag to avoid identical visible names across tabs
-    const baseName = nameRef.current || displayName;
-    const nameToUse = `${baseName}-${tabTagRef.current || ''}`;
+    // Use explicit user-provided name; never fall back to random ids
+    const baseName = (authedUser?.name || displayName || nameRef.current || '').toString().trim();
+    const nameToUse = baseName || 'Guest';
     const avatar = authedUser?.avatar || { kind: 'image', value: avatarGallery[0] };
     socket.emit("room:join", { roomId, userId: userIdRef.current, name: nameToUse, avatar });
+    try { nameMapRef.current[userIdRef.current] = nameToUse; } catch {}
     // Ensure new joiners sync the current whiteboard state immediately
     socket.emit('whiteboard:requestState');
     socket.emit('media:requestState');
@@ -1233,6 +1540,15 @@ export default function App() {
       try {
         const items = (payload?.items || []).map((m:any) => ({ name: m.name, url: m.dataUrl, type: m.type }));
         if (items.length) setMediaItems(prev => [...prev, ...items]);
+      } catch {}
+    });
+    socket.on('chat:message', (msg:any) => {
+      try {
+        const cid = msg?.cid;
+        if (cid && chatSeenRef.current.has(cid)) return;
+        if (cid) chatSeenRef.current.add(cid);
+        const attachments = Array.isArray(msg?.attachments) ? msg.attachments.map((a:any)=>({ name:a.name, type:a.type, url:a.dataUrl })) : undefined;
+        setChatLog(prev => [...prev, { userId: msg?.userId, name: msg?.name, text: msg?.text, ts: msg?.ts || Date.now(), attachments }]);
       } catch {}
     });
 
@@ -1277,16 +1593,81 @@ export default function App() {
 
     socket.on("presence:roster", (members: Array<{ id: string; name: string; avatar?: { kind: 'color' | 'image' | 'model'; value: string } }>) => {
       setRoster(members);
+      try { members.forEach(m=>{ if (m?.id) nameMapRef.current[m.id] = (m.name||m.id).toString(); }); } catch {}
       members.forEach((m: { id: string; name: string }) => maybeStartPeer(m.id));
     });
     socket.on("presence:join", (user: any) => {
+      try { if (user?.id) nameMapRef.current[user.id] = (user.name||user.id).toString(); } catch {}
       setRoster((prev: Array<{ id: string; name: string; avatar?: { kind: 'color' | 'image' | 'model'; value: string } }>) => {
         const exists = prev.some((m: { id: string; name: string }) => m.id === user.id);
         return exists ? prev : [...prev, user];
       });
+      // Ensure remote has a name tag text
+      try {
+        const obj = remoteAvatarsRef.current[user.id];
+        if (obj) {
+          const tag = obj.getObjectByName('nameTag') as THREE.Sprite | undefined;
+          if (!tag) {
+            const newTag = makeNameTag((user?.name || user?.id || '').toString());
+            obj.add(newTag);
+          } else {
+            // Repaint texture if needed
+            const nm = (user?.name || user?.id || '').toString();
+            const mat = (tag.material as THREE.SpriteMaterial);
+            const tex = mat.map as THREE.Texture;
+            if (tex && (tex.image as HTMLCanvasElement)) {
+              const canvas = tex.image as HTMLCanvasElement;
+              const ctx = canvas.getContext('2d');
+              if (ctx) {
+                ctx.clearRect(0,0,canvas.width,canvas.height);
+                ctx.fillStyle = 'rgba(0,0,0,0.55)';
+                ctx.fillRect(0,0,canvas.width,canvas.height);
+                ctx.fillStyle = '#fff';
+                ctx.font = 'bold 48px sans-serif';
+                ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                ctx.fillText(nm, canvas.width/2, canvas.height/2);
+                tex.needsUpdate = true;
+              }
+            }
+          }
+        }
+      } catch {}
       maybeStartPeer(user.id);
+      const group = remoteGroupRef.current;
+      const scene = sceneRef.current;
+      if (!group || !scene) return;
+      const existing = remoteAvatarsRef.current[user.id];
+      if (existing && existing.parent) existing.parent.remove(existing);
+      delete remoteAvatarsRef.current[user.id];
+      if (remoteMixersRef.current[user.id]) delete remoteMixersRef.current[user.id];
+      // Always use deterministic doctor model for remote user as well
+      let url = doctorModelForId(user.id);
+      (async () => {
+        const { group: obj, clips } = await loadModel(url);
+        obj.traverse((o) => { (o as any).castShadow = true; });
+        normalizeAvatar(obj, 1.75);
+        remoteAvatarsRef.current[user.id] = obj;
+        group.add(obj);
+        // Add name tag (remote: show name or placeholder)
+        try { const nameText = (user.name || 'Guest').toString(); const tag = makeNameTag(nameText); obj.add(tag); } catch {}
+        if (clips && clips.length) {
+          const mixer = new THREE.AnimationMixer(obj);
+          remoteMixersRef.current[user.id] = mixer;
+          mixer.clipAction(clips[0]).play();
+        }
+        const last = lastPoseRef.current[user.id];
+        if (last) {
+          const y = Math.max(floorYAt(scene, last.p[0], last.p[2]), 0);
+          obj.position.set(last.p[0], y, last.p[2]);
+          obj.rotation.set(last.r[0], last.r[1], last.r[2]);
+        } else {
+          // No pose yet: place deterministically near entrance and snap to floor
+          try { placeAvatarAtEntrance(obj, user.id); } catch {}
+        }
+      })();
     });
     socket.on("presence:update", (user: { id: string; name: string; avatar?: { kind: 'color' | 'image' | 'model'; value: string } }) => {
+      try { if (user?.id) nameMapRef.current[user.id] = (user.name||user.id).toString(); } catch {}
       setRoster((prev: Array<{ id: string; name: string; avatar?: { kind: 'color' | 'image' | 'model'; value: string } }>) =>
         prev.map((m) => (m.id === user.id ? { ...m, avatar: user.avatar, name: user.name } : m))
       );
@@ -1307,14 +1688,16 @@ export default function App() {
       if (existing && existing.parent) existing.parent.remove(existing);
       delete remoteAvatarsRef.current[user.id];
       if (remoteMixersRef.current[user.id]) delete remoteMixersRef.current[user.id];
-      let url = modelUrls[0];
-      if (user?.avatar?.kind === 'model') url = user.avatar.value as any;
-      else url = modelUrlForAvatar(user?.avatar?.value || avatarGallery[0]);
+      // Always use deterministic doctor model for remote user as well
+      let url = doctorModelForId(user.id);
       (async () => {
         const { group: obj, clips } = await loadModel(url);
         obj.traverse((o) => { (o as any).castShadow = true; });
+        normalizeAvatar(obj, 1.75);
         remoteAvatarsRef.current[user.id] = obj;
         group.add(obj);
+        // Add name tag (remote: show name or placeholder)
+        try { const nameText = (user.name || 'Guest').toString(); const tag = makeNameTag(nameText); obj.add(tag); } catch {}
         if (clips && clips.length) {
           const mixer = new THREE.AnimationMixer(obj);
           remoteMixersRef.current[user.id] = mixer;
@@ -1325,6 +1708,9 @@ export default function App() {
         if (last) {
           obj.position.set(last.p[0], last.p[1], last.p[2]);
           obj.rotation.set(last.r[0], last.r[1], last.r[2]);
+        } else {
+          // No pose yet: place deterministically near entrance and snap to floor
+          try { placeAvatarAtEntrance(obj, user.id); } catch {}
         }
       })();
     });
@@ -1334,6 +1720,24 @@ export default function App() {
       delete remoteAvatarsRef.current[user.id];
       setRoster((prev: Array<{ id: string; name: string }>) => prev.filter((m: { id: string; name: string }) => m.id !== user.id));
       teardownPeer(user.id);
+    });
+
+    // Media presence updates for mic/cam across the room
+    socket.on('presence:media', (msg: { userId: string; mic: boolean; cam: boolean }) => {
+      if (!msg || !msg.userId) return;
+      mediaPresenceRef.current[msg.userId] = { mic: !!msg.mic, cam: !!msg.cam };
+      try { forceRerender((x) => x + 1); } catch {}
+    });
+    // Initial presence snapshot when joining
+    socket.on('presence:media:state', (arr: Array<{ userId: string; mic: boolean; cam: boolean }>) => {
+      try {
+        if (Array.isArray(arr)) {
+          for (const it of arr) {
+            if (it && it.userId) mediaPresenceRef.current[it.userId] = { mic: !!it.mic, cam: !!it.cam };
+          }
+          forceRerender((x) => x + 1);
+        }
+      } catch {}
     });
 
     // handle remote avatar poses
@@ -1346,26 +1750,59 @@ export default function App() {
       let mesh = remoteAvatarsRef.current[userId];
       if (!mesh) {
         const member = roster.find((m) => m.id === userId);
-        let url = modelUrls[0];
-        if (member?.avatar?.kind === 'model') url = member.avatar.value as any;
-        else url = modelUrlForAvatar(member?.avatar?.value || avatarGallery[0]);
+        let url = doctorModelForId(userId);
         (async () => {
           const { group: obj, clips } = await loadModel(url);
           obj.traverse((o) => { (o as any).castShadow = true; });
+          normalizeAvatar(obj, 1.75);
           remoteAvatarsRef.current[userId] = obj;
           group.add(obj);
+          // Add name tag (remote: show name only)
+          try {
+            const label = (nameMapRef.current[userId] || member?.name || 'Guest').toString();
+            const tag = makeNameTag(label);
+            obj.add(tag);
+          } catch {}
           if (clips && clips.length) {
             const mixer = new THREE.AnimationMixer(obj);
             remoteMixersRef.current[userId] = mixer;
             mixer.clipAction(clips[0]).play();
           }
-          obj.position.set(p[0], p[1], p[2]);
-          obj.rotation.set(r[0], r[1], r[2]);
+          if (p && r) {
+            const y = floorYRef.current || floorYAt(scene, p[0], p[2]);
+            const feet = (obj as any).__feetOffset || 0;
+            obj.position.set(p[0], Math.max(0, y + feet), p[2]);
+            obj.rotation.set(r[0], r[1], r[2]);
+          } else { try { placeAvatarAtEntrance(obj, userId); } catch {} }
         })();
         return;
       }
-      mesh.position.set(p[0], p[1], p[2]);
-      mesh.rotation.set(r[0], r[1], r[2]);
+      // Store target pose for smoothing in the render loop
+      remotePoseTargetsRef.current[userId] = { p, r };
+      // Refresh name tag every pose to ensure correct label
+      try {
+        const label = (nameMapRef.current[userId] || 'Guest').toString();
+        let tag = mesh.getObjectByName('nameTag') as THREE.Sprite | undefined;
+        if (!tag) { mesh.add(makeNameTag(label)); }
+        else {
+          const mat = (tag.material as THREE.SpriteMaterial);
+          const tex = mat.map as THREE.Texture;
+          if (tex && (tex.image as HTMLCanvasElement)) {
+            const canvas = tex.image as HTMLCanvasElement;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.clearRect(0,0,canvas.width,canvas.height);
+              ctx.fillStyle = 'rgba(0,0,0,0.55)';
+              ctx.fillRect(0,0,canvas.width,canvas.height);
+              ctx.fillStyle = '#fff';
+              ctx.font = 'bold 48px sans-serif';
+              ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+              ctx.fillText(label, canvas.width/2, canvas.height/2);
+              tex.needsUpdate = true;
+            }
+          }
+        }
+      } catch {}
       lastPoseRef.current[userId] = { p, r };
       const audio = remoteAudioRef.current[userId];
       if (audio) audio.panner.positionX.value = p[0], audio.panner.positionY.value = p[1], audio.panner.positionZ.value = p[2];
@@ -1451,8 +1888,8 @@ export default function App() {
       } catch {}
     });
 
-    // Start Deepgram streaming for higher accuracy transcription
-    startDeepgramStreaming();
+    // Start Deepgram streaming for higher accuracy transcription (only when browser SR is off)
+    if (!USE_BROWSER_SR) startDeepgramStreaming();
     const interval = setInterval(() => {
       if (meetingEndedRef.current) return;
       if (!localAvatarRef.current) return;
@@ -1502,8 +1939,6 @@ export default function App() {
         socket.off('transcript:ready');
       } catch {}
       socket.disconnect();
-      setRoster([]);
-      setChatLog([]);
       // Clear remote avatar refs
       try {
         Object.keys(remoteAvatarsRef.current).forEach((id) => { delete remoteAvatarsRef.current[id]; });
@@ -1519,7 +1954,7 @@ export default function App() {
       await resumeAllRemoteAudio();
       try {
         // Only rely on Deepgram streaming, not browser SR
-        if (joined && !meetingEnded && !dgStreamingRef.current) {
+        if (!USE_BROWSER_SR && joined && !meetingEnded && !dgStreamingRef.current) {
           await startDeepgramStreaming();
         }
       } catch {}
@@ -1583,10 +2018,17 @@ export default function App() {
   useEffect(() => { loadMeetings(); }, []);
   useEffect(() => { meetingEndedRef.current = meetingEnded; }, [meetingEnded]);
 
+  const cleanName = (s: string | undefined | null): string => {
+    const n = (s || '').trim();
+    // Remove trailing hyphenated 2-3 char suffix like "-r1p" or "-oir" only if likely an auto-uid tag
+    const m = n.match(/^(.*?)-(\w{2,3})$/);
+    if (m) return m[1];
+    return n;
+  };
   const nameForUserId = (uid: string): string => {
-    if (uid === userIdRef.current) return authedUser?.name || displayName;
+    if (uid === userIdRef.current) return cleanName(authedUser?.name || displayName);
     const m = roster.find(r => r.id === uid);
-    return m?.name || 'Guest';
+    return cleanName(m?.name) || '';
   };
 
   // Map any avatar to a visible image representation
@@ -1608,9 +2050,9 @@ export default function App() {
 
   const formatTime = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-  const buildSummary = (fullTranscript: string, chatArr: Array<{userId:string; name:string; text:string; ts:number}>) => {
+  const buildSummary = (fullTranscript: string, chatArr: Array<{userId:string; name:string; text?: string; ts:number}>) => {
     const txt = (fullTranscript || '').trim();
-    const chatText = (chatArr || []).map(m=>`${m.name}: ${m.text}`).join(' ');
+    const chatText = (chatArr || []).filter(m=> typeof m.text === 'string' && !!m.text).map(m=>`${m.name}: ${m.text}`).join(' ');
     const all = `${txt} ${chatText}`.trim();
     if (!all) return ["No transcript captured."];
     const sents = all.split(/(?<=\.|\?|!)\s+/).map(s=>s.trim()).filter(Boolean);
@@ -1684,14 +2126,14 @@ export default function App() {
 
   useEffect(() => {
     if (!USE_BROWSER_SR) return;
-    // If a recognizer already exists, don't create another
+    // Start SR only when user is joined, mic is ON, and meeting is active
+    if (!joined || meetingEnded || !micEnabled) return;
+    // If already running, do nothing
     if (recognitionRef.current) return;
     let recognition: any = null;
     let stopRequested = false;
-    let lastResultTs = Date.now();
     const SpeechRecognition: any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) { setSttAvailable(false); setSttStatus('unsupported'); return; }
-    if (!joined || meetingEnded) { setSttStatus('not_joined'); return; }
     if (sttManualStopRef.current) { setSttStatus('stopped'); return; }
     recognition = new SpeechRecognition();
     recognition.continuous = true;
@@ -1699,7 +2141,6 @@ export default function App() {
     recognition.lang = 'en-IN';
     try { recognition.maxAlternatives = 1; } catch {}
     recognition.onstart = () => { try { setSttStatus('running'); console.log('SpeechRecognition started'); } catch {} };
-    let recent = '';
     recognition.onresult = (e: any) => {
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -1707,67 +2148,48 @@ export default function App() {
         if (res.isFinal) {
           const txt = (res[0]?.transcript || '').trim();
           if (txt) {
-            transcriptRef.current = ((transcriptRef.current || '') + ' ' + txt).trim();
-            recent = (recent + ' ' + txt).trim();
+            // Do not mutate local transcript here; rely on server broadcast to keep all tabs in sync
             try { socketRef.current?.emit('stt:segment', { text: txt }); } catch {}
           }
         } else {
           interim += res[0]?.transcript || '';
         }
       }
-      lastResultTs = Date.now();
-      const display = ((transcriptRef.current || '') + (interim ? (' ' + interim.trim()) : '')).trim();
+      const it = (interim || '').trim();
+      if (it) { try { socketRef.current?.emit('stt:interim', { text: it }); } catch {} }
+      const display = ((transcriptRef.current || '') + (it ? (' ' + it) : '')).trim();
       setTranscript(display);
     };
-    recognition.onspeechstart = () => { try { console.log('SpeechRecognition speechstart'); } catch {} };
-    recognition.onspeechend = () => { try { console.log('SpeechRecognition speechend'); } catch {} };
-    recognition.onerror = (e: any) => {
-      const name = (e?.error || '').toString();
-      try { console.warn('SpeechRecognition error:', name); } catch {}
-      // Do not spin if user explicitly blocked
-      if (name.includes('not-allowed') || name.includes('service-not-allowed')) return;
-      if (!stopRequested && !sttManualStopRef.current) setTimeout(() => { try { recognition.start(); } catch {} }, 1200);
-    };
-    recognition.onaudioend = () => { if (!stopRequested && !sttManualStopRef.current) { try { recognition.start(); } catch {} } };
-    recognition.onsoundend = () => { if (!stopRequested && !sttManualStopRef.current) { try { recognition.start(); } catch {} } };
-    recognition.onend = () => {
-      try { console.log('SpeechRecognition ended, restarting'); } catch {}
-      if (!stopRequested && !sttManualStopRef.current) try { recognition.start(); } catch {}
-    };
-    // Request mic permission before starting SR to avoid silent failures
+    recognition.onerror = () => {};
+    recognition.onend = () => { if (!stopRequested) { setSttStatus('idle'); } };
+    // Favor fast/continuous capture
+    try {
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
+      if (sttLang && typeof sttLang === 'string') { recognition.lang = sttLang; }
+    } catch {}
     (async () => {
-      try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch {}
+      try {
+        await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1
+          }
+        } as any);
+      } catch {}
       try { recognition.start(); setSttStatus('running'); } catch {}
     })();
     recognitionRef.current = recognition;
-    const watchdog = setInterval(() => {
-      if (stopRequested) return;
-      const idleFor = Date.now() - lastResultTs;
-      if (idleFor > 12000) {
-        try { console.log('SpeechRecognition idle >12s, restarting'); } catch {}
-        try { recognition.stop(); } catch {}
-        try { recognition.start(); } catch {}
-        lastResultTs = Date.now();
-      }
-    }, 6000);
-    const summarizer = setInterval(() => {
-      if (!recent) return;
-      const text = recent.trim();
-      const words = text.split(/\s+/);
-      const last = words.slice(-40).join(' ');
-      const summary = last.length > 0 ? `Recent: ${last}` : '';
-      if (summary) setSummaries((prev) => [...prev, summary].slice(-20));
-      recent = '';
-    }, 10000);
     return () => {
       stopRequested = true;
-      clearInterval(summarizer);
-      clearInterval(watchdog);
       try { recognition.stop(); } catch {}
       recognitionRef.current = null;
       if (!sttManualStopRef.current && joined && !meetingEnded && sttAvailable) setSttStatus('idle');
     };
-  }, [joined, meetingEnded, sttAvailable]);
+  }, [joined, meetingEnded, sttAvailable, micEnabled]);
 
   // Keep STT status in sync with session/support changes
   useEffect(() => {
@@ -1790,7 +2212,7 @@ export default function App() {
       .filter((v,i,a)=> a.findIndex(x=>x.id===v.id)===i);
     const finalSummary = (payload.summary && payload.summary.length)
       ? payload.summary
-      : buildSummary(payload.transcript || '', chatLog);
+      : buildSummary(payload.transcript || '', chatLog.filter((m)=> typeof m.text === 'string' && !!m.text));
     const meeting = {
       id: `m_${Date.now()}`,
       roomId,
@@ -1800,7 +2222,10 @@ export default function App() {
       transcript: payload.transcript,
       participants,
       whiteboardImage: payload.whiteboardImage,
-      chat: chatLog.slice(-500)
+      chat: chatLog
+        .filter((m)=> typeof m.text === 'string' && !!m.text)
+        .slice(-500)
+        .map((m)=> ({ userId: m.userId, name: m.name, text: m.text as string, ts: m.ts }))
     };
     lastMeetingIdRef.current = meeting.id;
     try {
@@ -2075,8 +2500,13 @@ export default function App() {
 
   const pointerToCanvasXY = (canvas: HTMLCanvasElement, clientX: number, clientY: number): [number, number] => {
     const rect = canvas.getBoundingClientRect();
-    const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
-    const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
+    const cssX = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    const cssY = Math.max(0, Math.min(rect.height, clientY - rect.top));
+    // Map CSS pixels to canvas internal pixel coordinates
+    const scaleX = rect.width > 0 ? (canvas.width / rect.width) : 1;
+    const scaleY = rect.height > 0 ? (canvas.height / rect.height) : 1;
+    const x = cssX * scaleX;
+    const y = cssY * scaleY;
     return [x, y];
   };
 
@@ -2193,6 +2623,39 @@ export default function App() {
           <div className="absolute bottom-0 right-0 h-64 w-64 bg-[#C63D5A]/20 rounded-full blur-3xl animate-ping" />
         </div>
       )}
+
+      
+
+      {enlargedPeer && (
+        <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center" onClick={()=> setEnlargedPeer(null)}>
+          <div className="relative w-[92vw] max-w-6xl aspect-video" onClick={(e)=> e.stopPropagation()}>
+            <button
+              className="absolute -top-10 right-0 h-8 w-8 rounded-full bg-white/10 hover:bg-white/20 border border-white/20 flex items-center justify-center text-white"
+              aria-label="Close enlarged video"
+              onClick={()=> setEnlargedPeer(null)}
+            >
+              <X size={16} />
+            </button>
+            <video
+              className="w-full h-full rounded-lg bg-black"
+              autoPlay
+              playsInline
+              ref={(el: HTMLVideoElement | null) => {
+                if (!el) return;
+                const s = getStreamForPeer(enlargedPeer);
+                if (s && el.srcObject !== s) {
+                  try { el.srcObject = s; } catch {}
+                }
+                try { (el as any).muted = (enlargedPeer === userIdRef.current); } catch {}
+              }}
+            />
+            <div className="absolute top-2 left-2 flex items-center gap-1 px-2 py-1 rounded bg-black/60 text-white text-xs">
+              <img src={avatarForUserId(enlargedPeer)} onError={(e)=>{ e.currentTarget.src = avatarGallery[0]; }} className="h-5 w-5 rounded-full object-cover" />
+              <span>{enlargedPeer === userIdRef.current ? (authedUser?.name || displayName || 'You') : nameForUserId(enlargedPeer)}</span>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Lobby: shown after login/onboarding but before join */}
       {sessionReady && !onboardingOpen && !joined && (
         <div className="fixed inset-0 z-40 flex items-center justify-center overflow-hidden">
@@ -2229,16 +2692,30 @@ export default function App() {
                     </div>
                   </div>
                 )}
+                
                 {lobbyMode === 'use' && (
                   <div className="mt-4 p-4 rounded-xl bg-white/10 border border-white/20">
                     <label className="text-sm text-white/80">Enter Room Code</label>
                     <div className="mt-2 flex gap-2">
-                      <input className="flex-1 rounded-md px-3 py-2 bg-white/10 border border-white/20 text-white placeholder-white/70 focus:outline-none focus:ring-2 focus:ring-[#7A00FF]" value={roomCodeInput} onChange={(e)=>setRoomCodeInput(e.target.value.toUpperCase())} placeholder="e.g., RABC123" />
-                      <button className="rounded-md px-5 py-2 bg-gradient-to-r from-[#3D2C8D] to-[#7A00FF] hover:brightness-110 text-white shadow-lg" onClick={() => {
-                        if (!roomCodeInput) return;
+                      <input className="flex-1 rounded-md px-3 py-2 bg-white/10 border border-white/20 text-white placeholder-white/70 focus:outline-none focus:ring-2 focus:ring-[#7A00FF]" value={roomCodeInput} onChange={(e)=>setRoomCodeInput(e.target.value.toUpperCase())} placeholder="enter code" />
+                      <button className="rounded-md px-5 py-2 bg-gradient-to-r from-[#3D2C8D] to-[#7A00FF] hover:brightness-110 text-white shadow-lg" onClick={async () => {
+                        if (!roomCodeInput || !(displayName||'').trim()) { setErrorMsg('Enter your name and room'); return; }
+                        try {
+                          const resp = await fetch('http://localhost:3001/api/auth/login', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name: displayName?.trim(), specialization })
+                          });
+                          const data = await resp.json().catch(()=>({ ok:false }));
+                          if (data && data.ok && data.user) {
+                            const userObj = { id: data.user.id, name: data.user.name, email: 'guest@local', avatar: { kind: 'image' as const, value: avatarImage } };
+                            setAuthedUser(userObj);
+                            try { sessionStorage.setItem('authUser', JSON.stringify(userObj)); } catch {}
+                          }
+                        } catch {}
                         setRoomId(roomCodeInput);
                         setJoined(true);
                         sessionStorage.setItem('lastRoomId', roomCodeInput);
+                        try { sessionStorage.setItem('specialization', specialization); } catch {}
                         sessionStorage.setItem('joined','1');
                       }}>Join</button>
                       <button className="rounded-md px-4 py-2 bg-white/10 hover:bg-white/20 text-white border border-white/20" onClick={async()=>{
@@ -2272,17 +2749,17 @@ export default function App() {
                 >{copied ? 'Copied ✓' : 'Copy Code'}</button>
               </span>
             )}
-          </div>
           {!joined ? (
             <div className="flex items-center gap-2">
               <input className="input w-44 bg-[#1E1E1E] text-[#F1F1F1] placeholder:text-[#A0A0A0] border border-[#2A2A2A]" placeholder="Your name" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
               <input className="input w-44 bg-[#1E1E1E] text-[#F1F1F1] placeholder:text-[#A0A0A0] border border-[#2A2A2A]" placeholder="Room code" value={roomCodeInput} onChange={(e) => setRoomCodeInput(e.target.value)} />
-              <button className="btn-secondary hover:brightness-110 bg-[#2A2A2A] text-white" onClick={() => {
-                const user = authedUser || { id: userIdRef.current, name: displayName || `Guest-${Math.floor(Math.random()*1000)}`, email: 'guest@local', avatar: { kind: 'image' as const, value: avatarImage } };
-                user.name = displayName || user.name;
+                <button className="btn-secondary hover:brightness-110 bg-[#2A2A2A] text-white" onClick={() => {
+                if (!(displayName||'').trim()) { setErrorMsg('Enter your name'); return; }
+                const user = authedUser || { id: userIdRef.current, name: displayName.trim(), email: 'guest@local', avatar: { kind: 'image' as const, value: avatarImage } };
+                user.name = displayName.trim();
                 setAuthedUser(user);
-                try { localStorage.setItem('authUser', JSON.stringify(user)); } catch {}
-              }}>Set Name</button>
+                try { sessionStorage.setItem('authUser', JSON.stringify(user)); } catch {}
+                }}>Use</button>
               <button className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" onClick={() => { const code = roomCodeInput.trim(); if (code) { setRoomId(code); sessionStorage.setItem('lastRoomId', code); } }}>Use Code</button>
               <button className={`btn-secondary ${pasted ? 'bg-emerald-500 text-black animate-pulse' : 'bg-white/10'} border border-white/20`} onClick={async()=>{ try { const t = await navigator.clipboard.readText(); if (t) { setRoomCodeInput(t.trim()); setPasted(true); setTimeout(()=>setPasted(false), 1200); } } catch {} }}>Paste Code</button>
               <button className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" onClick={() => { const code = "room-" + Math.random().toString(36).slice(2, 8); setRoomId(code); setRoomCodeInput(code); sessionStorage.setItem('lastRoomId', code); }}>Create Room</button>
@@ -2291,9 +2768,30 @@ export default function App() {
                 setErrorMsg(null);
                 try {
                   let code = roomId || roomCodeInput.trim();
-                  if (!code) { code = "room-" + Math.random().toString(36).slice(2, 8); setRoomId(code); setRoomCodeInput(code); sessionStorage.setItem('lastRoomId', code); }
-                  let user = authedUser;
-                  if (!user) { user = { id: userIdRef.current, name: displayName || `Guest-${Math.floor(Math.random()*1000)}`, email: "guest@local", avatar: { kind: 'image' as const, value: avatarImage } }; setAuthedUser(user); sessionStorage.setItem('sessionAuthed', '1'); }
+                  if (!code) { setErrorMsg('Enter room code or click Create Room'); return; }
+                  if (!(displayName||'').trim()) { setErrorMsg('Enter your name'); return; }
+                  try {
+                    const resp = await fetch('http://localhost:3001/api/auth/login', {
+                      method: 'POST', headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ name: displayName.trim(), specialization })
+                    });
+                    const data = await resp.json().catch(()=>({ ok:false }));
+                    if (data && data.ok && data.user) {
+                      const userObj = { id: data.user.id, name: data.user.name, email: 'guest@local', avatar: { kind: 'image' as const, value: avatarImage } };
+                      setAuthedUser(userObj);
+                      try { sessionStorage.setItem('authUser', JSON.stringify(userObj)); } catch {}
+                    } else if (!authedUser) {
+                      const fallback = { id: userIdRef.current, name: (displayName||'User'), email: 'guest@local', avatar: { kind: 'image' as const, value: avatarImage } };
+                      setAuthedUser(fallback);
+                      sessionStorage.setItem('sessionAuthed', '1');
+                    }
+                  } catch {
+                    if (!authedUser) {
+                      const fallback = { id: userIdRef.current, name: (displayName||'User'), email: 'guest@local', avatar: { kind: 'image' as const, value: avatarImage } };
+                      setAuthedUser(fallback);
+                      sessionStorage.setItem('sessionAuthed', '1');
+                    }
+                  }
                   if (!joined) {
                     let stream: MediaStream | null = null;
                     try { stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }); setMicEnabled(true); setCamEnabled(true); }
@@ -2306,8 +2804,11 @@ export default function App() {
                     const url = modelUrls[idx];
                     const { group: obj, clips } = await loadModel(url);
                     obj.traverse((o) => { (o as any).castShadow = true; });
+                    try { normalizeAvatar(obj, 1.75); } catch {}
                     localAvatarRef.current = obj;
                     const scene = sceneRef.current; if (scene) scene.add(obj);
+                    // Place local avatar at entrance initially, then floor-snap via movement
+                    try { placeAvatarAtEntrance(obj, userIdRef.current); } catch {}
                     // Hide placeholder cube if present
                     try { const ph = scene?.getObjectByName('placeholderBox'); if (ph) (ph as any).visible = false; } catch {}
                     // Spawn near center in a circle so multiple users appear around the center
@@ -2333,22 +2834,65 @@ export default function App() {
                 saveMeeting({ transcript: transcriptRef.current || transcript || '', summary: bullets, whiteboardImage });
                 try { socketRef.current?.emit('meeting:end'); } catch {}
               }}>{`End Meeting (${timerText})`}</button>
-              <div className="flex items-center gap-2 pl-2 border-l border-white/20">
+              <button className="flex items-center gap-2 pl-2 border-l border-white/20" onClick={()=>setProfileOpen(true)}>
                 <img src={avatarForUserId(userIdRef.current)} onError={(e)=>{ e.currentTarget.src = avatarGallery[0]; }} className="h-7 w-7 rounded-full object-cover" />
                 <span className="text-white text-sm font-medium">{authedUser?.name || displayName || 'You'}</span>
-              </div>
+              </button>
             </div>
           )}
+        </div>
         </div>
         {joined && menuOpen && (
           <div className="absolute left-4 top-14 z-20 w-56 rounded-md border border-white/20 bg-[#1E1E1E] text-[#F1F1F1] shadow-xl">
             <button className="w-full text-left px-3 py-2 hover:bg-white/10" onClick={() => { loadMeetings(); setDashboardOpen(true); setMenuOpen(false); }}>Dashboard</button>
-            <a className="block px-3 py-2 hover:bg-white/10" href="#media-access" onClick={() => setMenuOpen(false)}>Media Access</a>
+            
             <button className="w-full text-left px-3 py-2 hover:bg-white/10" onClick={() => { setWbOpen((v)=>!v); setMenuOpen(false); }}>{wbOpen ? 'Hide Whiteboard' : 'Show Whiteboard'}</button>
+            <button className="w-full text-left px-3 py-2 hover:bg-white/10" onClick={async () => { setMenuOpen(false); await requestAiSummary(); }}>AI Summary</button>
+            <button className="w-full text-left px-3 py-2 hover:bg-white/10" onClick={() => { try { const lines = (reportItems && reportItems.length) ? reportItems : ['No summary yet']; const text = lines.map((s)=>`- ${s}`).join('\n'); const blob = new Blob([text], { type: 'text/plain;charset=utf-8' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `room-${roomId || 'session'}-ai-summary.txt`; document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); try{ a.remove(); } catch{} }, 800); } catch {} setMenuOpen(false); }}>Download AI Report</button>
             <button className="w-full text-left px-3 py-2 hover:bg-white/10" onClick={() => { sessionStorage.removeItem('sessionAuthed'); setSessionReady(false); setJoined(false); setMenuOpen(false); }}>Logout</button>
           </div>
         )}
       </header>
+
+      {profileOpen && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60" onClick={()=>setProfileOpen(false)} />
+          <div className="relative z-10 w-full max-w-md rounded-2xl border border-white/20 bg-[#1E1E1E]/95 text-white shadow-2xl p-6">
+            <h4 className="text-lg font-semibold">Profile</h4>
+            <div className="mt-4 space-y-2 text-sm">
+              <div className="flex justify-between"><span className="text-white/70">Name</span><span>{authedUser?.name || displayName || '—'}</span></div>
+              <div className="flex justify-between"><span className="text-white/70">Specialization</span><span>{(typeof window!=='undefined' ? (sessionStorage.getItem('specialization')||specialization) : specialization) || '—'}</span></div>
+              <div className="flex justify-between"><span className="text-white/70">Room</span><span>{roomId || (typeof window!=='undefined' ? (sessionStorage.getItem('lastRoomId')||'') : '') || '—'}</span></div>
+            </div>
+            <div className="mt-6 text-right">
+              <button className="rounded-md px-4 py-2 bg-white/10 hover:bg-white/20 border border-white/20" onClick={()=>setProfileOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {reportOpen && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60" onClick={()=>setReportOpen(false)} />
+          <div className="relative z-10 w-full max-w-lg rounded-2xl border border-white/20 bg-[#1E1E1E]/95 text-white shadow-2xl p-6">
+            <div className="flex items-center justify-between">
+              <h4 className="text-lg font-semibold">Post-Meeting Report</h4>
+              <button className="rounded-md px-3 py-1 bg-white/10 hover:bg-white/20 border border-white/20" onClick={()=>setReportOpen(false)}>Close</button>
+            </div>
+            <div className="mt-4 space-y-2 text-sm">
+              {Array.isArray(reportItems) && reportItems.length > 0 ? (
+                <ul className="list-disc pl-5 space-y-1">
+                  {reportItems.map((it, idx) => (
+                    <li key={idx} className="text-[#F1F1F1]">{it}</li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="text-white/70">No summary yet.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <main className={`flex-1 grid grid-cols-12 gap-4 container-page py-4 transition-all duration-500 ${mounted ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'}`}>
 
@@ -2356,20 +2900,38 @@ export default function App() {
         <aside className="col-span-12 md:col-span-3">
           <div className="card shadow-sm bg-black/40 backdrop-blur-sm border border-white/10 transition-all duration-300">
             <div className="card-body">
-              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Participants</h3>
-              {roster.length === 0 ? (
-                <p className="text-sm text-[#A0A0A0]">No participants yet.</p>
-              ) : (
-                <ul className="mt-2 flex flex-col gap-2 text-sm">
-                  {[{ id: userIdRef.current, name: authedUser?.name || displayName, avatar: authedUser?.avatar },
-                    ...roster.filter((m)=> m.id !== userIdRef.current)
-                   ].map((m) => (
-                    <li key={m.id} className="flex items-center gap-2 bg-black/50 px-2 py-1 rounded border border-white/10">
-                      <img src={avatarForUserId(m.id)} onError={(e)=>{ e.currentTarget.src = avatarGallery[0]; }} className="h-5 w-5 rounded-full object-cover" />
-                      {m.id===userIdRef.current ? `You: ${m.name}` : m.name}
-                    </li>
-                  ))}
-                </ul>
+              <div className="flex items-center justify-between">
+                <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Participants</h3>
+                <button
+                  className={`h-7 w-7 grid place-items-center rounded-md border border-white/10 bg-white/5 hover:bg-white/10 transition ${participantsCollapsed ? 'rotate-180' : ''}`}
+                  onClick={() => setParticipantsCollapsed(v=>!v)}
+                  aria-label="Toggle participants"
+                  title="Toggle participants"
+                >
+                  <ChevronDown size={14} className="text-white" />
+                </button>
+              </div>
+              {!participantsCollapsed && (
+                roster.length === 0 ? (
+                  <p className="mt-2 text-sm text-[#A0A0A0]">No participants yet.</p>
+                ) : (
+                  <ul className="mt-3 grid grid-cols-1 gap-2 text-sm">
+                    {[{ id: userIdRef.current, name: authedUser?.name || displayName, avatar: authedUser?.avatar },
+                      ...roster.filter((m)=> m.id !== userIdRef.current)
+                     ].map((m) => (
+                      <li key={m.id} className="flex items-center justify-between gap-2 rounded-xl px-2 py-2 bg-white/5 border border-white/10">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <img src={avatarForUserId(m.id)} onError={(e)=>{ e.currentTarget.src = avatarGallery[0]; }} className="h-6 w-6 rounded-full object-cover" />
+                          <span className="truncate text-[#F1F1F1]">{m.id===userIdRef.current ? `You: ${nameForUserId(m.id)}` : nameForUserId(m.id)}</span>
+                        </div>
+                        <div className="flex items-center gap-2 text-white/80">
+                          {micLiveForUser(m.id) ? <Mic size={14} className="text-emerald-400" /> : <MicOff size={14} className="text-red-400" />}
+                          {camLiveForUser(m.id) ? <VideoIcon size={14} className="text-emerald-400" /> : <VideoOff size={14} className="text-red-400" />}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )
               )}
             </div>
           </div>
@@ -2377,64 +2939,10 @@ export default function App() {
             <div className="card-body">
               <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Participants Video</h3>
               <div className="mt-3 space-y-3">
-                <div className="grid grid-cols-1 gap-2">
-                  <button
-                    className={`w-full rounded-full px-4 py-2 font-semibold btn-primary from-[#3D2C8D] to-[#7A00FF] bg-gradient-to-r disabled:opacity-60 disabled:cursor-not-allowed`}
-                    disabled={meetingEnded || micBusy}
-                    onClick={async () => {
-                      if (meetingEnded || micBusy) return;
-                      setMicBusy(true);
-                      try {
-                        await ensureMediaIfNeeded();
-                        let st = mediaStreamRef.current;
-                        if (!st) { try { st = await navigator.mediaDevices.getUserMedia({ audio: true }); mediaStreamRef.current = st; } catch { setErrorMsg(null); return; } }
-                        let a = st.getAudioTracks()[0];
-                        if (!a) { try { const anew = (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0]; st.addTrack(anew); a = anew; } catch { setErrorMsg(null); return; } }
-                        if (a.enabled) { await replaceAudioTrackForAll(null); a.enabled = false; if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = 0.0; if (micLevelRafRef.current) { cancelAnimationFrame(micLevelRafRef.current); micLevelRafRef.current = null; } setMicLevel(0); lastVoiceTsRef.current = 0; setMicEnabled(false); }
-                        else {
-                          if (a.readyState === 'ended') { try { const anew = (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0]; st.addTrack(anew); await replaceAudioTrackForAll(anew); a = anew; } catch { setErrorMsg(null); return; } }
-                          else { await replaceAudioTrackForAll(a); }
-                          a.enabled = true;
-                          try {
-                            if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') { audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)(); }
-                            if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume();
-                            if (!micMonitorRef.current) { try { const src = audioCtxRef.current.createMediaStreamSource(st); const gain = audioCtxRef.current.createGain(); gain.gain.value = 0.0; src.connect(gain).connect(audioCtxRef.current.destination); micMonitorRef.current = { source: src, gain }; } catch {} }
-                            if (!micAnalyserRef.current) { try { const analyser = audioCtxRef.current.createAnalyser(); analyser.fftSize = 256; micAnalyserRef.current = analyser; micMonitorRef.current?.source.connect(analyser); } catch {} }
-                            if (!micLevelRafRef.current && micAnalyserRef.current) { const analyser = micAnalyserRef.current; const data = new Uint8Array(analyser.frequencyBinCount); const loop = () => { try { analyser.getByteTimeDomainData(data); } catch {} let sum = 0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum += v*v;} const rms=Math.sqrt(sum/data.length); setMicLevel(Math.min(1,rms*2)); micLevelRafRef.current = requestAnimationFrame(loop); }; micLevelRafRef.current = requestAnimationFrame(loop); }
-                          } catch {}
-                          if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = 1.0;
-                          setMicEnabled(true);
-                          resumeAllRemoteAudio();
-                        }
-                      } finally { setMicBusy(false); }
-                    }}
-                  >{micEnabled ? 'Mute Mic' : 'Unmute Mic'}</button>
-                  <button
-                    className={`w-full rounded-full px-4 py-2 font-semibold btn-primary disabled:opacity-60 disabled:cursor-not-allowed`}
-                    disabled={meetingEnded || camBusy}
-                    onClick={async () => {
-                      if (meetingEnded || camBusy) return;
-                      setCamBusy(true);
-                      try {
-                        await ensureMediaIfNeeded();
-                        let st = mediaStreamRef.current;
-                        if (!st) { try { st = await navigator.mediaDevices.getUserMedia({ video: true }); mediaStreamRef.current = st; } catch { setErrorMsg(null); return; } }
-                        let vtrack = st.getVideoTracks()[0];
-                        if (camEnabled && vtrack) { await replaceVideoTrackForAll(null); vtrack.stop(); st.removeTrack(vtrack); setCamEnabled(false); if (videoRef.current) videoRef.current.srcObject = st; }
-                        else if (!camEnabled) {
-                          try {
-                            if (!vtrack || vtrack.readyState === 'ended') { const v = await navigator.mediaDevices.getUserMedia({ video: true }); const newTrack = v.getVideoTracks()[0]; st.addTrack(newTrack); await replaceVideoTrackForAll(newTrack); }
-                            else { await replaceVideoTrackForAll(vtrack); }
-                            if (videoRef.current) videoRef.current.srcObject = st; setCamEnabled(true); resumeAllRemoteAudio();
-                          } catch { setErrorMsg(null); }
-                        }
-                      } finally { setCamBusy(false); }
-                    }}
-                  >{camEnabled ? 'Turn Camera Off' : 'Turn Camera On'}</button>
-                </div>
+                
                 <div className="grid grid-cols-2 md:grid-cols-2 gap-3">
                   {!meetingEnded && camEnabled && mediaStreamRef.current && (
-                    <div className="relative">
+                    <div className="relative cursor-zoom-in" onClick={()=> setEnlargedPeer(userIdRef.current)}>
                       <video className="w-full aspect-video rounded-lg bg-black" muted playsInline autoPlay ref={(el: HTMLVideoElement | null) => { if (el && el.srcObject !== mediaStreamRef.current) el.srcObject = mediaStreamRef.current; }} />
                       <div className="absolute top-1 left-1 flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px]">
                         <img src={avatarForUserId(userIdRef.current)} onError={(e)=>{ e.currentTarget.src = avatarGallery[0]; }} className="h-4 w-4 rounded-full object-cover" />
@@ -2447,7 +2955,7 @@ export default function App() {
                     const vids = stream.getVideoTracks();
                     const hasVideo = vids && vids.length>0 && vids[0].readyState==='live';
                     return (
-                      <div key={peerId} className="relative">
+                      <div key={peerId} className="relative cursor-zoom-in" onClick={()=> setEnlargedPeer(peerId)}>
                         {hasVideo ? (
                           <video className="w-full aspect-video rounded-lg bg-black" autoPlay playsInline ref={(el: HTMLVideoElement | null) => { if (el && el.srcObject !== stream) el.srcObject = stream; try { (el as any).muted = false; } catch {} }} />
                         ) : (
@@ -2470,43 +2978,13 @@ export default function App() {
               </div>
             </div>
           </div>
-          <div id="media-access" className="mt-4 card shadow-sm bg-black/40 backdrop-blur-sm border border-white/10 transition-all duration-300">
+          <div className="mt-4 card shadow-sm bg-black/40 backdrop-blur-sm border border-white/10 transition-all duration-300">
             <div className="card-body">
-              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Media Access</h3>
-              <input type="file" multiple accept="image/*,application/pdf" className="mt-2 text-sm" onChange={(e)=>{
-                const files = Array.from(e.target.files || []);
-                const items: Array<{name:string;url:string;type:string}> = [];
-                const toBroadcast: Array<{name:string;type:string;dataUrl:string}> = [];
-                const readers: Promise<void>[] = [];
-                for (const f of files) {
-                  const url = URL.createObjectURL(f);
-                  items.push({ name: f.name, url, type: f.type });
-                  const p = new Promise<void>((resolve)=>{
-                    const r = new FileReader();
-                    r.onload = () => { toBroadcast.push({ name: f.name, type: f.type, dataUrl: (r.result as string) || '' }); resolve(); };
-                    r.onerror = () => resolve();
-                    r.readAsDataURL(f);
-                  });
-                  readers.push(p);
-                }
-                setMediaItems(prev => [...prev, ...items]);
-                Promise.all(readers).then(()=>{
-                  if (toBroadcast.length > 0) socketRef.current?.emit('media:add', { items: toBroadcast });
-                });
-              }} />
-              {mediaItems.length>0 && (
-                <div className="mt-3 grid grid-cols-3 gap-2">
-                  {mediaItems.map((m,i)=> (
-                    <a key={i} href={m.url} target="_blank" className="block border border-[#2A2A2A] rounded overflow-hidden bg-[#111111]">
-                      {m.type.startsWith('image/') ? (
-                        <img src={m.url} className="w-full h-24 object-cover" />
-                      ) : (
-                        <div className="h-24 w-full grid place-items-center text-xs text-[#A0A0A0]">{m.name}</div>
-                      )}
-                    </a>
-                  ))}
-                </div>
-              )}
+              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Transcript</h3>
+              <div className="mt-2 max-h-56 overflow-y-auto rounded-md border border-white/10 bg-black/30 p-2 text-sm text-[#F1F1F1] whitespace-pre-wrap">
+                {(transcriptRef.current || transcript || '').trim()}
+                {interimText ? <span className="opacity-60"> {(interimText || '').trim()}</span> : null}
+              </div>
             </div>
           </div>
           {errorMsg && (<p className="text-sm text-red-600 mt-1">{errorMsg}</p>)}
@@ -2518,10 +2996,22 @@ export default function App() {
             <div className="relative">
               <div className="p-3 flex items-center justify-between">
                 <div className="flex flex-wrap items-center gap-2">
-                  <button className="btn-secondary" onClick={()=>setWbOpen((v)=>!v)}>{wbOpen ? 'Hide Whiteboard' : 'Show Whiteboard'}</button>
-                  <button className="btn-secondary" onClick={()=>{ setDocOpen(v=>!v); if (!docOpen) socketRef.current?.emit('doc:requestState'); }}>{docOpen ? 'Hide Doc' : 'Open Doc'}</button>
-                  <button className="btn-primary" onClick={()=> { setSummaryBusy(true); setSummaryText(''); socketRef.current?.emit('stt:summary'); }} disabled={summaryBusy}>{summaryBusy ? 'Summarizing…' : 'Transcript Summary'}</button>
-                  <button className="btn-secondary" onClick={()=> setMotionTracking(v=>!v)}>{motionTracking ? 'Disable Motion Tracking' : 'Enable Motion Tracking'}</button>
+                  <button
+                    className="h-9 w-9 rounded-lg border border-white/15 bg-white/10 hover:bg-white/20 text-white grid place-items-center"
+                    onClick={()=>setWbOpen((v)=>!v)}
+                    title={wbOpen ? 'Hide Whiteboard' : 'Show Whiteboard'}
+                    aria-label={wbOpen ? 'Hide Whiteboard' : 'Show Whiteboard'}
+                  >
+                    <SquarePen size={16} />
+                  </button>
+                  <button
+                    className="h-9 w-9 rounded-lg border border-white/15 bg-white/10 hover:bg-white/20 text-white grid place-items-center"
+                    onClick={()=>{ setDocOpen(v=>!v); if (!docOpen) socketRef.current?.emit('doc:requestState'); }}
+                    title={docOpen ? 'Hide Doc' : 'Open Doc'}
+                    aria-label={docOpen ? 'Hide Doc' : 'Open Doc'}
+                  >
+                    <FileText size={16} />
+                  </button>
                 </div>
               </div>
               {docOpen && (
@@ -2662,83 +3152,22 @@ export default function App() {
               />
             </div>
           </div>
-          {joined && (
-            <div className="mt-4">
-              <div className="card shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
-                <div className="card-body">
-                  <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Transcript Preview</h3>
-                  <div className="mt-2">
-                    <div className="mb-2 flex items-center gap-2 text-xs text-white/80">
-                      <label className="inline-flex items-center gap-1 cursor-pointer select-none">
-                        <input type="checkbox" checked={monitorOn} onChange={(e)=>{ setMonitorOn(e.target.checked); try { if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = e.target.checked ? 0.15 : 0.0; } catch {} }} />
-                        Monitor mic (hear yourself)
-                      </label>
-                    </div>
-                    {!dgActive && (
-                      <div className="mb-2">
-                        <button
-                          className="btn border border-white/20 bg-white/10 hover:bg-white/20 text-white text-xs px-3 py-1 rounded"
-                          onClick={async ()=>{ try { await audioCtxRef.current?.resume?.(); } catch {}; await startDeepgramStreaming(); try { await startRecognition(); } catch {} }}
-                        >
-                          Enable Microphone
-                        </button>
-                      </div>
-                    )}
-                    <div className="text-[11px] text-white/60 mb-1">Mic level</div>
-                    <div className="h-2 w-full bg-white/10 rounded overflow-hidden">
-                      <div
-                        className="h-2 bg-emerald-400 transition-[width] duration-150"
-                        style={{ width: `${Math.min(100, Math.max(0, Math.round((micLevel||0) * 100)))}%` }}
-                        aria-label="Microphone input level"
-                      />
-                    </div>
-                  </div>
-                  <div className="mt-2 max-h-48 overflow-y-auto border border-[#2A2A2A] rounded p-3 bg-[#111111] text-sm whitespace-pre-wrap text-[#F1F1F1]" aria-live="polite">
-                    {sttWarn && (
-                      <div className="mb-2 text-amber-400">
-                        {sttWarnMsg || 'No speech detected. Check mic permissions and retry.'}
-                        <button
-                          className="ml-2 inline-flex items-center px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200"
-                          onClick={() => { setSttWarn(false); setSttWarnMsg(''); try { startRecognition(); } catch {}; try { startDeepgramStreaming(); } catch {}; }}
-                        >
-                          Retry
-                        </button>
-                      </div>
-                    )}
-                    {(() => {
-                      const base = transcript && transcript.trim().length > 0 ? transcript : 'Listening…';
-                      return interimText ? `${base} ${interimText}` : base;
-                    })()}
-                  </div>
-                  <div className="mt-3">
-                    <div className="text-[11px] text-white/60 mb-1">Share 3D model thumbnail</div>
-                    <input
-                      type="file"
-                      accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
-                      onChange={async (e) => {
-                        const f = e.currentTarget.files?.[0]; if (!f) return;
-                        const blobUrl = URL.createObjectURL(f);
-                        const thumb = await generateGlbThumbnail(blobUrl);
-                        if (thumb) {
-                          socketRef.current?.emit('media:add', { items: [{ name: f.name, type: 'image/png', dataUrl: thumb }] });
-                          setMediaItems(prev => [...prev, { name: f.name, url: thumb, type: 'image/png' }]);
-                        }
-                      }}
-                      className="block w-full text-xs text-[#A0A0A0]"
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
         </section>
 
         {/* Right sidebar: Chat */}
         <aside className="col-span-12 md:col-span-3">
           <div className="card shadow-sm bg-black/40 backdrop-blur-sm border border-white/10 transition-all duration-300 flex flex-col sticky top-4 h-[calc(100vh-6rem)]">
           <div className="card-body flex flex-col min-h-0 flex-1">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Chat</h3>
+                <div className="ml-auto mr-2 flex items-center gap-2">
+                  <button aria-label={micEnabled ? 'Mute microphone' : 'Unmute microphone'} className={`h-8 w-8 rounded-full flex items-center justify-center border border-white/10 bg-white/5 hover:bg-white/10 transition ${micEnabled ? 'text-green-400' : 'text-red-400'}`} onClick={toggleMic}>
+                    {micEnabled ? <Mic size={16} /> : <MicOff size={16} />}
+                  </button>
+                  <button aria-label={camEnabled ? 'Turn camera off' : 'Turn camera on'} className={`h-8 w-8 rounded-full flex items-center justify-center border border-white/10 bg-white/5 hover:bg-white/10 transition ${camEnabled ? 'text-green-400' : 'text-red-400'}`} onClick={toggleCam}>
+                    {camEnabled ? <VideoIcon size={16} /> : <VideoOff size={16} />}
+                  </button>
+                </div>
                 <img src={avatarForUserId(userIdRef.current)} onError={(e)=>{ e.currentTarget.src = avatarGallery[0]; }} className="h-6 w-6 rounded-full object-cover" />
               </div>
                 <div className="mt-2 border border-[#2A2A2A] rounded p-2 bg-[#111111] flex-1 overflow-y-auto">
@@ -2753,7 +3182,26 @@ export default function App() {
                             <img src={avatarForUserId(m.userId)} onError={(e)=>{ e.currentTarget.src = avatarGallery[0]; }} className="h-6 w-6 rounded-full object-cover mr-2" />
                             <div className={`${isSelf ? 'bg-[#3D2C8D] text-white' : 'bg-[#2A2A2A] text-[#F1F1F1]'} rounded-2xl px-3 py-2 max-w-[75%] shadow-sm`}>
                               {!isSelf && <div className="text-[10px] text-[#A0A0A0] mb-0.5">{nameForUserId(m.userId)}</div>}
-                              <div className="whitespace-pre-wrap break-words">{m.text}</div>
+                              {m.text ? (
+                                <div className="whitespace-pre-wrap break-words">{m.text}</div>
+                              ) : null}
+                              {Array.isArray(m.attachments) && m.attachments.length>0 && (
+                                <div className="mt-1 space-y-2">
+                                  {m.attachments.map((a,idx)=> (
+                                    <div key={idx} className="border border-white/10 rounded-md overflow-hidden bg-black/20">
+                                      {a.type && a.type.startsWith('image/') ? (
+                                        <a href={a.url} target="_blank" rel="noreferrer">
+                                          <img src={a.url} alt={a.name} className="max-h-48 rounded-md object-contain" />
+                                        </a>
+                                      ) : (
+                                        <a href={a.url} download={a.name} target="_blank" rel="noreferrer" className="block px-2 py-1 text-xs underline break-all">
+                                          {a.name || 'file'}
+                                        </a>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
                               <div className={`text-[10px] mt-0.5 ${isSelf ? 'text-white/70' : 'text-[#A0A0A0]'}`}>{formatTime(m.ts)}</div>
                             </div>
                           </li>
@@ -2761,11 +3209,64 @@ export default function App() {
                       })}
                     </ul>
                   )}
+                  {chatInput.trim().length > 0 && (
+                    <div className="mt-3 flex items-center gap-2 text-xs text-white/70">
+                      <span>Typing</span>
+                      <span className="flex gap-1">
+                        <span className="h-1.5 w-1.5 rounded-full bg-white/50 animate-pulse"></span>
+                        <span className="h-1.5 w-1.5 rounded-full bg-white/50 animate-pulse [animation-delay:150ms]"></span>
+                        <span className="h-1.5 w-1.5 rounded-full bg-white/50 animate-pulse [animation-delay:300ms]"></span>
+                      </span>
+                    </div>
+                  )}
                 </div>
-              <div className="mt-2 flex gap-2">
-                <input className="input flex-1 bg-[#1E1E1E] text-[#F1F1F1] placeholder:text-[#A0A0A0] border border-[#2A2A2A]" placeholder="Type a message" value={chatInput} onChange={(e)=>{ if (meetingEnded) return; setChatInput(e.target.value);} } disabled={meetingEnded} onKeyDown={(e)=>{ if(meetingEnded) return; if(e.key==='Enter'){ const raw = chatInput.trim(); if(!raw) return; const text = medMode ? `[MED] ${raw}` : raw; const cid = `${userIdRef.current}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`; chatSeenRef.current.add(cid); setChatLog(prev => [...prev, { userId: userIdRef.current, name: authedUser?.name || displayName, text, ts: Date.now() }]); socketRef.current?.emit('chat:message', { text, cid }); setChatInput(''); } }} />
-                <button className="btn-primary shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF]" onClick={()=>{ if (meetingEnded) return; const raw = chatInput.trim(); if(!raw) return; const text = medMode ? `[MED] ${raw}` : raw; const cid = `${userIdRef.current}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`; chatSeenRef.current.add(cid); setChatLog(prev => [...prev, { userId: userIdRef.current, name: authedUser?.name || displayName, text, ts: Date.now() }]); socketRef.current?.emit('chat:message', { text, cid }); setChatInput(''); }}>Send</button>
+              <div className="mt-2 flex gap-2 items-center">
+                <button
+                  className="h-10 w-10 rounded-lg border border-white/15 bg-white/10 hover:bg-white/20 text-white grid place-items-center"
+                  title="Attach files"
+                  aria-label="Attach files"
+                  onClick={()=> chatFileInputRef.current?.click()}
+                >
+                  +
+                </button>
+                <input
+                  ref={chatFileInputRef}
+                  type="file"
+                  multiple
+                  accept="image/*,application/pdf,video/*"
+                  className="hidden"
+                  onChange={(e)=>{
+                    const files = Array.from(e.target.files || []);
+                    if (!files.length) return;
+                    const next: Array<{name:string;type:string;dataUrl:string}> = [];
+                    const readers: Promise<void>[] = [];
+                    for (const f of files) {
+                      const p = new Promise<void>((resolve)=>{
+                        const r = new FileReader();
+                        r.onload = () => { next.push({ name: f.name, type: f.type, dataUrl: (r.result as string) || '' }); resolve(); };
+                        r.onerror = () => resolve();
+                        r.readAsDataURL(f);
+                      });
+                      readers.push(p);
+                    }
+                    Promise.all(readers).then(()=>{
+                      if (next.length>0) setChatAttachments(prev => [...prev, ...next]);
+                      try { if (chatFileInputRef.current) chatFileInputRef.current.value = ''; } catch {}
+                    });
+                  }}
+                />
+                <input className="input flex-1 bg-[#1E1E1E] text-[#F1F1F1] placeholder:text-[#A0A0A0] border border-[#2A2A2A]" placeholder="Type a message" value={chatInput} onChange={(e)=>{ if (meetingEnded) return; const v=e.target.value; setChatInput(v); setIsTyping(v.trim().length>0);} } disabled={meetingEnded} onKeyDown={(e)=>{ if(meetingEnded) return; if(e.key==='Enter'){ const raw = chatInput.trim(); const text = medMode ? (raw ? `[MED] ${raw}` : '') : raw; if (!text && chatAttachments.length===0) return; const cid = `${userIdRef.current}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`; chatSeenRef.current.add(cid); const atts = chatAttachments.map(a=>({ name:a.name, type:a.type, url:a.dataUrl })); setChatLog(prev => [...prev, { userId: userIdRef.current, name: authedUser?.name || displayName, text: text || undefined, ts: Date.now(), attachments: atts.length?atts:undefined }]); socketRef.current?.emit('chat:message', { text, cid, attachments: chatAttachments }); setChatInput(''); setIsTyping(false); setChatAttachments([]);} }} />
+                <button className="btn-primary shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF]" onClick={()=>{ if (meetingEnded) return; const raw = chatInput.trim(); const text = medMode ? (raw ? `[MED] ${raw}` : '') : raw; if (!text && chatAttachments.length===0) return; const cid = `${userIdRef.current}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`; chatSeenRef.current.add(cid); const atts = chatAttachments.map(a=>({ name:a.name, type:a.type, url:a.dataUrl })); setChatLog(prev => [...prev, { userId: userIdRef.current, name: authedUser?.name || displayName, text: text || undefined, ts: Date.now(), attachments: atts.length?atts:undefined }]); socketRef.current?.emit('chat:message', { text, cid, attachments: chatAttachments }); setChatInput(''); setChatAttachments([]); }}>Send</button>
               </div>
+              {chatAttachments.length>0 && (
+                <div className="mt-2 flex flex-wrap gap-2 text-xs text-white/80">
+                  {chatAttachments.map((a,i)=> (
+                    <div key={i} className="border border-white/15 rounded p-1 bg-white/5">
+                      <div className="max-w-[120px] truncate">{a.name}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
           {!joined && (
@@ -2807,6 +3308,21 @@ export default function App() {
                 <div className="mt-6 space-y-4">
                   <input className="w-full rounded-full px-5 py-3 bg-white/10 border border-white/20 placeholder-white/70 text-white focus:outline-none focus:ring-2 focus:ring-[#C63D5A] transition" placeholder="Email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} />
                   <input className="w-full rounded-full px-5 py-3 bg-white/10 border border-white/20 placeholder-white/70 text-white focus:outline-none focus:ring-2 focus:ring-[#C63D5A] transition" placeholder="Password" type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
+                  {/* Extra login fields */}
+                  <input className="w-full rounded-full px-5 py-3 bg-white/10 border border-white/20 placeholder-white/70 text-white focus:outline-none focus:ring-2 focus:ring-[#3D2C8D] transition" placeholder="Enter your name" value={displayName} onChange={(e)=>setDisplayName(e.target.value)} />
+                  <select className="w-full rounded-full px-5 py-3 bg-white text-black border border-black/20 focus:outline-none focus:ring-2 focus:ring-[#7A00FF] transition" value={specialization} onChange={(e)=>{ setSpecialization(e.target.value); try { sessionStorage.setItem('specialization', e.target.value); } catch {} }}>
+                    <option value="" disabled>Specialization</option>
+                    <option value="Pharmacologist">Pharmacologist</option>
+                    <option value="Biochemist">Biochemist</option>
+                    <option value="Clinical Pharmacist">Clinical Pharmacist</option>
+                    <option value="Toxicologist">Toxicologist</option>
+                    <option value="Medicinal Chemist">Medicinal Chemist</option>
+                  </select>
+                  <select className="w-full rounded-full px-5 py-3 bg-white text-black border border-black/20 focus:outline-none focus:ring-2 focus:ring-[#7A00FF] transition" onChange={(e)=>{ const code = e.target.value; if (code) setRoomCodeInput(code); }} defaultValue="">
+                    <option value="" disabled>Pick a preset room</option>
+                    {medicalRooms.map(r => (<option key={r.code} value={r.code}>{r.label}</option>))}
+                  </select>
+                  {/* Removed free type room field per request */}
                   {authMode === 'signup' && (
                     <input className="w-full rounded-full px-5 py-3 bg-white/10 border border-white/20 placeholder-white/70 text-white focus:outline-none focus:ring-2 focus:ring-[#C63D5A] transition" placeholder="Display name" value={authName} onChange={(e) => setAuthName(e.target.value)} />
                   )}
@@ -2824,11 +3340,33 @@ export default function App() {
                       const accounts = JSON.parse(localStorage.getItem('accounts') || '[]');
                       const found = accounts.find((a: any) => a.email === authEmail && a.password === authPassword);
                       if (!found) { setErrorMsg('Invalid credentials'); return; }
-                      found.name = authName || found.name;
+                      found.name = (displayName || authName || found.name);
                       if (avatarImage) found.avatar = { kind: 'image', value: avatarImage };
                       localStorage.setItem('accounts', JSON.stringify(accounts));
-                      localStorage.setItem('authUser', JSON.stringify(found));
-                      setAuthedUser(found);
+                      // Call backend login to persist name + specialization (Mongo optional)
+                      (async () => {
+                        try {
+                          const resp = await fetch('http://localhost:3001/api/auth/login', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name: (displayName || found.name), specialization })
+                          });
+                          const data = await resp.json().catch(()=>({ ok:false }));
+                          if (data && data.ok && data.user) {
+                            const userObj = { id: data.user.id, name: data.user.name, email: found.email, avatar: found.avatar };
+                            sessionStorage.setItem('authUser', JSON.stringify(userObj));
+                            setAuthedUser(userObj);
+                          } else {
+                            sessionStorage.setItem('authUser', JSON.stringify(found));
+                            setAuthedUser(found);
+                          }
+                        } catch {
+                          sessionStorage.setItem('authUser', JSON.stringify(found));
+                          setAuthedUser(found);
+                        }
+                        // Persist chosen room and specialization for later join
+                        if (roomCodeInput) sessionStorage.setItem('lastRoomId', roomCodeInput);
+                        try { sessionStorage.setItem('specialization', specialization); } catch {}
+                      })();
                       setDisplayName(found.name);
                       sessionStorage.setItem('sessionAuthed','1');
                       setSessionReady(true);
@@ -2946,7 +3484,7 @@ export default function App() {
                       if (updated) {
                         setAuthedUser(updated);
                         try {
-                          localStorage.setItem('authUser', JSON.stringify(updated));
+                          sessionStorage.setItem('authUser', JSON.stringify(updated));
                           const accounts = JSON.parse(localStorage.getItem('accounts') || '[]');
                           const idx = accounts.findIndex((a: any) => a.email === updated.email);
                           if (idx>=0) { accounts[idx] = { ...accounts[idx], avatar: updated.avatar }; localStorage.setItem('accounts', JSON.stringify(accounts)); }
